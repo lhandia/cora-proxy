@@ -35,7 +35,6 @@ async function handleCoraProxy(payload) {
 
   const hostname = ambiente === 'producao' ? 'matls-clients.api.cora.com.br' : 'matls-clients.api.stage.cora.com.br';
 
-  // Token
   const tokenRes = await mTlsRequest({
     hostname, path: '/token', method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -46,7 +45,6 @@ async function handleCoraProxy(payload) {
 
   const accessToken = JSON.parse(tokenRes.body).access_token;
 
-  // API call
   let fullPath = coraPath;
   if (params) {
     const sp = new URLSearchParams();
@@ -97,12 +95,3 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => console.log(`Proxy rodando na porta ${PORT}`));
-Arquivo 2: package.json — cole este:
-
-{
-  "name": "cora-mtls-proxy",
-  "version": "1.0.0",
-  "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" }
-}
