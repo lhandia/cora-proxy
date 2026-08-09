@@ -631,7 +631,14 @@ const server = http.createServer(async (req, res) => {
   // Health check
   if (route === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'cora-mtls-proxy', version: '3.0.0', endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy'] }));
+    res.end(JSON.stringify({
+      ok: true,
+      service: 'cora-mtls-proxy',
+      version: '3.1.0',
+      endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy'],
+      node_options: process.env.NODE_OPTIONS || '(não definido)',
+      openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
+    }));
     return;
   }
 
