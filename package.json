@@ -1,7 +1,12 @@
 {
   "name": "cora-mtls-proxy",
   "version": "1.0.0",
+  "description": "Proxy mTLS para a API da Cora — faz a ponte entre o Base44 (Deno Deploy) e a Cora",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" }
+  "scripts": {
+    "start": "node --openssl-legacy-provider server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
 }
