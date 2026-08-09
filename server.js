@@ -556,8 +556,24 @@ async function handleSerproProxy(payload) {
     });
   }
 
-  // Se test_only, retorna apenas a confirmação de autenticação
+  // Se test_only, retorna a confirmação de autenticação + tokens decodificados
   if (test_only) {
+    // Decodifica o JWT (access_token) para extrair o CNPJ do contratante
+    let jwtPayload = null;
+    let jwtTokenPayload = null;
+    try {
+      const parts = accessToken.split('.');
+      if (parts.length === 3) {
+        jwtPayload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+      }
+    } catch (e) {}
+    try {
+      const parts = jwtToken.split('.');
+      if (parts.length === 3) {
+        jwtTokenPayload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+      }
+    } catch (e) {}
+
     return {
       status: 200,
       data: {
@@ -567,6 +583,9 @@ async function handleSerproProxy(payload) {
         token_type: 'Bearer',
         access_token_preview: accessToken.substring(0, 20) + '...',
         ambiente: ambiente || 'trial',
+        // Tokens decodificados para descobrir o CNPJ do contratante
+        access_token_decoded: jwtPayload,
+        jwt_token_decoded: jwtTokenPayload,
       }
     };
   }
