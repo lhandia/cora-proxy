@@ -396,6 +396,179 @@ async function handleCoraProxy(payload) {
   return { status: apiRes.status, data: responseData };
 }
 
+// ═══════════════════════ SERPRO mTLS PROXY ═══════════════════════
+// O SERPRO (API Integra Contador) exige mTLS com certificado e-CNPJ (.pfx/.p12).
+// O Deno Deploy não consegue fazer mTLS, então este proxy faz a ponte.
+//
+// Fluxo: authenticate (mTLS) → access_token + jwt_token → chamada API (mTLS)
+
+// ── Cache de tokens SERPRO (evita reautenticar a cada chamada) ──
+const serproTokenCache = new Map(); // key: consumerKey|ambiente → { accessToken, jwtToken, expiresAt }
+const SERPRO_TOKEN_TTL_MS = 30 * 60 * 1000; // 30 minutos (tokens duram ~33min)
+
+/**
+ * Faz uma requisição HTTPS com mTLS usando certificado PFX (SERPRO).
+ * Diferente da Cora (que usa PEM+key), o SERPRO usa .pfx/.p12 com passphrase.
+ */
+function mTlsRequestPfx({ hostname, path, method, headers, body, pfx, passphrase }) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname,
+      port: 443,
+      path,
+      method: method || 'POST',
+      headers: headers || {},
+      pfx,
+      passphrase,
+      rejectUnauthorized: true,
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on('error', reject);
+    req.setTimeout(30000, () => {
+      req.destroy(new Error('Timeout na requisição ao SERPRO'));
+    });
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+/**
+ * Processa uma requisição proxy para o SERPRO (API Integra Contador).
+ * Recebe credenciais + certificado PFX, faz mTLS, retorna o resultado.
+ */
+async function handleSerproProxy(payload) {
+  const {
+    consumer_key,
+    consumer_secret,
+    cert_pfx_base64,
+    cert_senha,
+    ambiente,
+    test_only = true,
+    path: serproPath,
+    body: serproBody,
+  } = payload;
+
+  if (!consumer_key || !consumer_secret || !cert_pfx_base64) {
+    return { status: 400, data: { error: 'consumer_key, consumer_secret e cert_pfx_base64 são obrigatórios' } };
+  }
+
+  // Decodificar PFX
+  let pfxBuffer;
+  try {
+    pfxBuffer = Buffer.from(cert_pfx_base64, 'base64');
+  } catch (e) {
+    return { status: 400, data: { error: 'Certificado PFX inválido (base64 corrompido)' } };
+  }
+
+  // ── Passo 1: Autenticar no SERPRO (mTLS) ──
+  const cacheKey = consumer_key + '|' + (ambiente || 'trial');
+  const cached = serproTokenCache.get(cacheKey);
+  let accessToken = null;
+  let jwtToken = null;
+
+  if (cached && cached.expiresAt > Date.now()) {
+    accessToken = cached.accessToken;
+    jwtToken = cached.jwtToken;
+  }
+
+  if (!accessToken) {
+    const basicAuth = Buffer.from(`${consumer_key}:${consumer_secret}`).toString('base64');
+    const authRes = await mTlsRequestPfx({
+      hostname: 'autenticacao.sapi.serpro.gov.br',
+      path: '/authenticate',
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${basicAuth}`,
+        'role-type': 'TERCEIROS',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: 'grant_type=client_credentials',
+      pfx: pfxBuffer,
+      passphrase: cert_senha,
+    });
+
+    if (authRes.status !== 200) {
+      let errData;
+      try { errData = JSON.parse(authRes.body); } catch { errData = authRes.body; }
+      return {
+        status: 401,
+        data: {
+          error: 'Falha na autenticação SERPRO',
+          serpro_status: authRes.status,
+          serpro_response: errData,
+          hint: 'Verifique Consumer Key, Consumer Secret, certificado digital e senha. O certificado deve ser o mesmo e-CNPJ usado na contratação.',
+        }
+      };
+    }
+
+    let authData;
+    try { authData = JSON.parse(authRes.body); } catch {
+      return { status: 502, data: { error: 'Resposta de autenticação inválida', raw: authRes.body } };
+    }
+
+    accessToken = authData.access_token;
+    jwtToken = authData.jwt_token;
+
+    if (!accessToken) {
+      return { status: 502, data: { error: 'Token de acesso não recebido', resposta: authData } };
+    }
+
+    serproTokenCache.set(cacheKey, {
+      accessToken,
+      jwtToken,
+      expiresAt: Date.now() + SERPRO_TOKEN_TTL_MS,
+    });
+  }
+
+  // Se test_only, retorna apenas a confirmação de autenticação
+  if (test_only) {
+    return {
+      status: 200,
+      data: {
+        success: true,
+        message: 'Autenticação SERPRO realizada com sucesso',
+        expires_in: 2008,
+        token_type: 'Bearer',
+        access_token_preview: accessToken.substring(0, 20) + '...',
+        ambiente: ambiente || 'trial',
+      }
+    };
+  }
+
+  // ── Passo 2: Fazer chamada à API Integra Contador (mTLS) ──
+  if (!serproPath) {
+    return { status: 400, data: { error: 'path é obrigatório (Apoiar, Consultar, Declarar, Emitir, Monitorar)' } };
+  }
+
+  const basePath = ambiente === 'producao'
+    ? '/integra-contador/v1/'
+    : '/integra-contador-trial/v1/';
+
+  const apiRes = await mTlsRequestPfx({
+    hostname: 'gateway.apiserpro.serpro.gov.br',
+    path: basePath + serproPath,
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'jwt_token': jwtToken,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: serproBody ? JSON.stringify(serproBody) : undefined,
+    pfx: pfxBuffer,
+    passphrase: cert_senha,
+  });
+
+  let responseData;
+  try { responseData = JSON.parse(apiRes.body); } catch { responseData = apiRes.body; }
+
+  return { status: apiRes.status, data: responseData };
+}
+
 // ═══════════════════════ SERVIDOR HTTP ═══════════════════════
 
 const server = http.createServer(async (req, res) => {
@@ -415,7 +588,7 @@ const server = http.createServer(async (req, res) => {
   try { pathname = new URL(req.url, 'http://localhost').pathname; } catch {}
   // remove possíveis prefixos comuns antes da rota
   const stripPrefix = (p) => {
-    for (const prefix of ['/cora-proxy', '/hotmart-proxy', '/health']) {
+    for (const prefix of ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/health']) {
       if (p === prefix || p === prefix + '/') return prefix;
       if (p.endsWith(prefix)) return prefix;
     }
@@ -426,7 +599,7 @@ const server = http.createServer(async (req, res) => {
   // Health check
   if (route === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'cora-mtls-proxy', version: '2.1.0', endpoints: ['/cora-proxy', '/hotmart-proxy'] }));
+    res.end(JSON.stringify({ ok: true, service: 'cora-mtls-proxy', version: '3.0.0', endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy'] }));
     return;
   }
 
@@ -447,6 +620,29 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(result.data));
     } catch (error) {
       console.error('[hotmart-proxy] Erro:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
+  // ── SERPRO proxy ──
+  if (route === '/serpro-proxy' && req.method === 'POST') {
+    const authHeader = req.headers.authorization;
+    if (authHeader !== `Bearer ${PROXY_API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized — API key inválida' }));
+      return;
+    }
+    let bodyStr = '';
+    for await (const chunk of req) bodyStr += chunk;
+    try {
+      const payload = JSON.parse(bodyStr);
+      const result = await handleSerproProxy(payload);
+      res.writeHead(result.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result.data));
+    } catch (error) {
+      console.error('[serpro-proxy] Erro:', error.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: error.message }));
     }
@@ -481,7 +677,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'PROXY_ROUTE_NOT_FOUND', received_path: pathname, method: req.method, endpoints: ['/cora-proxy (POST)', '/hotmart-proxy (POST)', '/health (GET)'], hint: 'Se você acabou de implantar a rota /hotmart-proxy, aguarde o redeploy concluir e tente novamente.' }));
+  res.end(JSON.stringify({ error: 'PROXY_ROUTE_NOT_FOUND', received_path: pathname, method: req.method, endpoints: ['/cora-proxy (POST)', '/hotmart-proxy (POST)', '/serpro-proxy (POST)', '/health (GET)'], hint: 'Se você acabou de implantar uma nova rota, aguarde o redeploy concluir e tente novamente.' }));
 });
 
 server.listen(PORT, () => {
