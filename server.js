@@ -464,6 +464,23 @@ async function handleSerproProxy(payload) {
     return { status: 400, data: { error: 'Certificado PFX inválido (base64 corrompido)' } };
   }
 
+  // ── Pré-validação do PFX: tenta carregar o secure context para detectar erros cedo ──
+  try {
+    require('tls').createSecureContext({ pfx: pfxBuffer, passphrase: cert_senha });
+  } catch (e) {
+    return {
+      status: 400,
+      data: {
+        error: 'Certificado PFX não pôde ser carregado',
+        detalhe: e.message,
+        code: e.code,
+        hint: e.message === 'unsupported' || (e.message && e.message.includes('unsupported'))
+          ? 'O algoritmo do PFX provavelmente não é suportado pelo OpenSSL 3 do Node.js 18. Adicione NODE_OPTIONS=--openssl-legacy-provider nas variáveis de ambiente do Railway, ou reexporte o certificado com algoritmo moderno (AES-256).'
+          : 'Verifique se o base64 está correto e se a senha do certificado está correta.',
+      }
+    };
+  }
+
   // ── Passo 1: Autenticar no SERPRO (mTLS) ──
   const cacheKey = consumer_key + '|' + (ambiente || 'trial');
   const cached = serproTokenCache.get(cacheKey);
@@ -477,19 +494,34 @@ async function handleSerproProxy(payload) {
 
   if (!accessToken) {
     const basicAuth = Buffer.from(`${consumer_key}:${consumer_secret}`).toString('base64');
-    const authRes = await mTlsRequestPfx({
-      hostname: 'autenticacao.sapi.serpro.gov.br',
-      path: '/authenticate',
-      method: 'POST',
-      headers: {
-        'Authorization': `Basic ${basicAuth}`,
-        'role-type': 'TERCEIROS',
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: 'grant_type=client_credentials',
-      pfx: pfxBuffer,
-      passphrase: cert_senha,
-    });
+    let authRes;
+    try {
+      authRes = await mTlsRequestPfx({
+        hostname: 'autenticacao.sapi.serpro.gov.br',
+        path: '/authenticate',
+        method: 'POST',
+        headers: {
+          'Authorization': `Basic ${basicAuth}`,
+          'role-type': 'TERCEIROS',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: 'grant_type=client_credentials',
+        pfx: pfxBuffer,
+        passphrase: cert_senha,
+      });
+    } catch (e) {
+      return {
+        status: 502,
+        data: {
+          error: 'Erro na conexão mTLS com o SERPRO',
+          detalhe: e.message,
+          code: e.code,
+          hint: e.message === 'unsupported' || (e.message && e.message.includes('unsupported'))
+            ? 'Algoritmo do PFX não suportado pelo OpenSSL 3. Adicione NODE_OPTIONS=--openssl-legacy-provider no Railway.'
+            : 'Verifique conectividade de rede e validade do certificado.',
+        }
+      };
+    }
 
     if (authRes.status !== 200) {
       let errData;
