@@ -404,7 +404,7 @@ async function handleCoraProxy(payload) {
 
 // ── Cache de tokens SERPRO (evita reautenticar a cada chamada) ──
 const serproTokenCache = new Map(); // key: consumerKey|ambiente → { accessToken, jwtToken, expiresAt }
-const SERPRO_TOKEN_TTL_MS = 30 * 60 * 1000; // 30 minutos (tokens duram ~33min)
+const SERPRO_TOKEN_TTL_MS = 5 * 60 * 1000; // 5 minutos (seguro — SERPRO pode expirar antes do esperado)
 
 /**
  * Faz uma requisição HTTPS com mTLS usando certificado PFX (SERPRO).
@@ -448,6 +448,7 @@ async function handleSerproProxy(payload) {
     cert_senha,
     ambiente,
     test_only = true,
+    force_reauth = false,
     path: serproPath,
     body: serproBody,
   } = payload;
@@ -483,6 +484,10 @@ async function handleSerproProxy(payload) {
 
   // ── Passo 1: Autenticar no SERPRO (mTLS) ──
   const cacheKey = consumer_key + '|' + (ambiente || 'trial');
+  // force_reauth: invalida o cache de token para forçar nova autenticação
+  if (force_reauth) {
+    serproTokenCache.delete(cacheKey);
+  }
   const cached = serproTokenCache.get(cacheKey);
   let accessToken = null;
   let jwtToken = null;
@@ -549,16 +554,20 @@ async function handleSerproProxy(payload) {
       return { status: 502, data: { error: 'Token de acesso não recebido', resposta: authData } };
     }
 
+    // Usa o expires_in real do SERPRO (em segundos), com fallback de 5 min
+    const expiresInSeconds = authData.expires_in || 300;
+    const safeTtlMs = Math.min(expiresInSeconds * 1000, SERPRO_TOKEN_TTL_MS);
     serproTokenCache.set(cacheKey, {
       accessToken,
       jwtToken,
-      expiresAt: Date.now() + SERPRO_TOKEN_TTL_MS,
+      expiresAt: Date.now() + safeTtlMs,
+      expiresInSeconds,
     });
   }
 
   // Se test_only, retorna a confirmação de autenticação + tokens decodificados
   if (test_only) {
-    // Decodifica o JWT (access_token) para extrair o CNPJ do contratante
+    // Decodifica o JWT (access_token) para extrair o CNPJ do contratante e a expiração
     let jwtPayload = null;
     let jwtTokenPayload = null;
     try {
@@ -574,15 +583,28 @@ async function handleSerproProxy(payload) {
       }
     } catch (e) {}
 
+    // Extrai expiração real do JWT (claim "exp" = timestamp Unix em segundos)
+    const jwtExp = jwtPayload?.exp;
+    const jwtTokenExp = jwtTokenPayload?.exp;
+    const now = Math.floor(Date.now() / 1000);
+
     return {
       status: 200,
       data: {
         success: true,
         message: 'Autenticação SERPRO realizada com sucesso',
-        expires_in: 2008,
+        expires_in: expiresInSeconds || (cached?.expiresInSeconds) || 0,
         token_type: 'Bearer',
         access_token_preview: accessToken.substring(0, 20) + '...',
         ambiente: ambiente || 'trial',
+        // Expiração real decodificada do JWT
+        access_token_exp: jwtExp,
+        access_token_exp_iso: jwtExp ? new Date(jwtExp * 1000).toISOString() : null,
+        access_token_exp_segundos_restantem: jwtExp ? (jwtExp - now) : null,
+        jwt_token_exp: jwtTokenExp,
+        jwt_token_exp_iso: jwtTokenExp ? new Date(jwtTokenExp * 1000).toISOString() : null,
+        jwt_token_exp_segundos_restantem: jwtTokenExp ? (jwtTokenExp - now) : null,
+        agora_iso: new Date().toISOString(),
         // Tokens decodificados para descobrir o CNPJ do contratante
         access_token_decoded: jwtPayload,
         jwt_token_decoded: jwtTokenPayload,
@@ -599,7 +621,7 @@ async function handleSerproProxy(payload) {
     ? '/integra-contador/v1/'
     : '/integra-contador-trial/v1/';
 
-  const apiRes = await mTlsRequestPfx({
+  let apiRes = await mTlsRequestPfx({
     hostname: 'gateway.apiserpro.serpro.gov.br',
     path: basePath + serproPath,
     method: 'POST',
@@ -614,10 +636,132 @@ async function handleSerproProxy(payload) {
     passphrase: cert_senha,
   });
 
+  // ── Se o token em cache expirou (401), invalida e refaz com token novo ──
+  if (apiRes.status === 401) {
+    serproTokenCache.delete(cacheKey);
+    const basicAuth = Buffer.from(`${consumer_key}:${consumer_secret}`).toString('base64');
+    const retryAuthRes = await mTlsRequestPfx({
+      hostname: 'autenticacao.sapi.serpro.gov.br',
+      path: '/authenticate',
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${basicAuth}`,
+        'role-type': 'TERCEIROS',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: 'grant_type=client_credentials',
+      pfx: pfxBuffer,
+      passphrase: cert_senha,
+    });
+    if (retryAuthRes.status === 200) {
+      let retryAuthData;
+      try { retryAuthData = JSON.parse(retryAuthRes.body); } catch { retryAuthData = null; }
+      if (retryAuthData?.access_token) {
+        accessToken = retryAuthData.access_token;
+        jwtToken = retryAuthData.jwt_token;
+        const retryExpiresInSeconds = retryAuthData.expires_in || 300;
+        const retrySafeTtlMs = Math.min(retryExpiresInSeconds * 1000, SERPRO_TOKEN_TTL_MS);
+        serproTokenCache.set(cacheKey, {
+          accessToken, jwtToken,
+          expiresAt: Date.now() + retrySafeTtlMs,
+          expiresInSeconds: retryExpiresInSeconds,
+        });
+        // Retry API call with fresh token
+        apiRes = await mTlsRequestPfx({
+          hostname: 'gateway.apiserpro.serpro.gov.br',
+          path: basePath + serproPath,
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'jwt_token': jwtToken,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: serproBody ? JSON.stringify(serproBody) : undefined,
+          pfx: pfxBuffer,
+          passphrase: cert_senha,
+        });
+      }
+    }
+  }
+
   let responseData;
   try { responseData = JSON.parse(apiRes.body); } catch { responseData = apiRes.body; }
 
   return { status: apiRes.status, data: responseData };
+}
+
+// ═══════════════════════ TESSERASIGN PROXY ═══════════════════════
+// O Base44 stripa o campo "file" de JSON bodies de incoming requests para /functions/*.
+// Isso impede chamar a API do TesseraSign (que exige "file") de dentro de uma função Base44.
+// Este proxy Node.js externo envia multipart/form-data com o PDF real, contornando o strip.
+
+const TESSERA_BASE_URL = 'https://tesserasign.base44.app';
+const TESSERA_WEBHOOK_URL = 'https://arcarius.base44.app/functions/webhookTesseraAssinatura';
+
+async function handleTesseraProxy(payload) {
+  const { tessera_api_key, pdf_base64, filename, signatario, mensagem, acordo_id } = payload;
+
+  if (!tessera_api_key) return { status: 400, data: { error: 'tessera_api_key é obrigatória' } };
+  if (!pdf_base64) return { status: 400, data: { error: 'pdf_base64 é obrigatório' } };
+  if (!signatario?.nome || !signatario?.email) return { status: 400, data: { error: 'signatario.nome e signatario.email são obrigatórios' } };
+
+  const nomeArquivo = filename || `acordo-${(acordo_id || '').slice(-8)}.pdf`;
+
+  // Construir multipart/form-data manualmente
+  const boundary = '----ArcariusTessera' + crypto.randomBytes(8).toString('hex');
+  const parts = [];
+
+  const addField = (name, value) => {
+    parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`);
+  };
+
+  addField('reference_id', acordo_id || '');
+  addField('webhook_url', TESSERA_WEBHOOK_URL);
+  addField('source_system', 'Arcarius ERP');
+  addField('signers', JSON.stringify([{
+    name: signatario.nome,
+    email: signatario.email,
+    cpf: signatario.cpf || undefined,
+    phone: signatario.whatsapp || signatario.telefone || undefined,
+    action: 'sign',
+  }]));
+  addField('message', mensagem || 'Por favor, assine o documento enviado pela Arcarius.');
+  addField('signature_type', 'advanced');
+
+  // Campo file — PDF binário real (decodifica base64 → bytes)
+  const pdfBuffer = Buffer.from(pdf_base64, 'base64');
+  const fileHeader = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${nomeArquivo}"\r\nContent-Type: application/pdf\r\n\r\n`;
+  const fileFooter = `\r\n`;
+  const closingBoundary = `--${boundary}--\r\n`;
+
+  // Constrói o body multipart como Buffer (mistura strings UTF-8 e bytes binários do PDF)
+  const bodyParts = [];
+  for (const part of parts) {
+    bodyParts.push(Buffer.from(part, 'utf8'));
+  }
+  bodyParts.push(Buffer.from(fileHeader, 'utf8'));
+  bodyParts.push(pdfBuffer);
+  bodyParts.push(Buffer.from(fileFooter, 'utf8'));
+  bodyParts.push(Buffer.from(closingBoundary, 'utf8'));
+  const bodyBuffer = Buffer.concat(bodyParts);
+
+  const result = await httpsRequest({
+    hostname: 'tesserasign.base44.app',
+    path: '/functions/publicApi',
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${tessera_api_key}`,
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      'Content-Length': bodyBuffer.length,
+    },
+    body: bodyBuffer,
+  });
+
+  let responseData;
+  try { responseData = JSON.parse(result.body); } catch { responseData = result.body; }
+
+  return { status: result.status, data: responseData };
 }
 
 // ═══════════════════════ SERVIDOR HTTP ═══════════════════════
@@ -639,7 +783,7 @@ const server = http.createServer(async (req, res) => {
   try { pathname = new URL(req.url, 'http://localhost').pathname; } catch {}
   // remove possíveis prefixos comuns antes da rota
   const stripPrefix = (p) => {
-    for (const prefix of ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/health']) {
+    for (const prefix of ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy', '/health']) {
       if (p === prefix || p === prefix + '/') return prefix;
       if (p.endsWith(prefix)) return prefix;
     }
@@ -654,7 +798,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: 'cora-mtls-proxy',
       version: '3.1.0',
-      endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy'],
+      endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
     }));
@@ -707,6 +851,29 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── TesseraSign proxy ──
+  if (route === '/tessera-proxy' && req.method === 'POST') {
+    const authHeader = req.headers.authorization;
+    if (authHeader !== `Bearer ${PROXY_API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized — API key inválida' }));
+      return;
+    }
+    let bodyStr = '';
+    for await (const chunk of req) bodyStr += chunk;
+    try {
+      const payload = JSON.parse(bodyStr);
+      const result = await handleTesseraProxy(payload);
+      res.writeHead(result.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result.data));
+    } catch (error) {
+      console.error('[tessera-proxy] Erro:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
   // Endpoint principal (Cora)
   if (route === '/cora-proxy' && req.method === 'POST') {
     // Validar API key
@@ -735,7 +902,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'PROXY_ROUTE_NOT_FOUND', received_path: pathname, method: req.method, endpoints: ['/cora-proxy (POST)', '/hotmart-proxy (POST)', '/serpro-proxy (POST)', '/health (GET)'], hint: 'Se você acabou de implantar uma nova rota, aguarde o redeploy concluir e tente novamente.' }));
+  res.end(JSON.stringify({ error: 'PROXY_ROUTE_NOT_FOUND', received_path: pathname, method: req.method,       endpoints: ['/cora-proxy (POST)', '/hotmart-proxy (POST)', '/serpro-proxy (POST)', '/tessera-proxy (POST)', '/health (GET)'], hint: 'Se você acabou de implantar uma nova rota, aguarde o redeploy concluir e tente novamente.' }));
 });
 
 server.listen(PORT, () => {
