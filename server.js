@@ -700,22 +700,29 @@ const TESSERA_BASE_URL = 'https://tesserasign.base44.app';
 const TESSERA_WEBHOOK_URL = 'https://arcarius.base44.app/functions/webhookTesseraAssinatura';
 
 /**
- * Faz upload de um arquivo binário para 0x0.st (hospedagem temporária gratuita).
+ * Faz upload de um arquivo binário para catbox.moe (hospedagem gratuita, sem auth).
  * Retorna a URL pública do arquivo.
  */
-function uploadTo0x0st(pdfBuffer, filename) {
+function uploadToCatbox(pdfBuffer, filename) {
   return new Promise((resolve, reject) => {
-    const boundary = '----UploadBoundary' + crypto.randomBytes(16).toString('hex');
+    const boundary = '----CatboxBoundary' + crypto.randomBytes(16).toString('hex');
     const parts = [];
-    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: application/pdf\r\n\r\n`, 'utf8'));
+
+    // Campo reqtype=fileupload
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="reqtype"\r\n\r\nfileupload\r\n`, 'utf8'));
+
+    // Campo fileToUpload (binário)
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="fileToUpload"; filename="${filename}"\r\nContent-Type: application/pdf\r\n\r\n`, 'utf8'));
     parts.push(pdfBuffer);
-    parts.push(Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'));
+    parts.push(Buffer.from('\r\n', 'utf8'));
+
+    parts.push(Buffer.from(`--${boundary}--\r\n`, 'utf8'));
     const body = Buffer.concat(parts);
 
     const req = https.request({
-      hostname: '0x0.st',
+      hostname: 'catbox.moe',
       port: 443,
-      path: '/',
+      path: '/user/api.php',
       method: 'POST',
       headers: {
         'Content-Type': `multipart/form-data; boundary=${boundary}`,
@@ -725,15 +732,15 @@ function uploadTo0x0st(pdfBuffer, filename) {
       let data = '';
       res.on('data', (chunk) => (data += chunk));
       res.on('end', () => {
-        if (res.statusCode === 200 && data.trim()) {
+        if (res.statusCode === 200 && data.trim().startsWith('http')) {
           resolve(data.trim());
         } else {
-          reject(new Error(`0x0.st retornou ${res.statusCode}: ${data}`));
+          reject(new Error(`catbox.moe retornou ${res.statusCode}: ${data}`));
         }
       });
     });
     req.on('error', reject);
-    req.setTimeout(30000, () => req.destroy(new Error('Timeout no upload para 0x0.st')));
+    req.setTimeout(30000, () => req.destroy(new Error('Timeout no upload para catbox.moe')));
     req.write(body);
     req.end();
   });
@@ -757,10 +764,10 @@ async function handleTesseraProxy(payload) {
   if (!pdfUrl && pdf_base64) {
     try {
       const pdfBuffer = Buffer.from(pdf_base64, 'base64');
-      pdfUrl = await uploadTo0x0st(pdfBuffer, nomeArquivo);
+      pdfUrl = await uploadToCatbox(pdfBuffer, nomeArquivo);
       console.log('[tessera-proxy] PDF uploaded to:', pdfUrl);
     } catch (e) {
-      return { status: 500, data: { error: 'Falha ao fazer upload do PDF para 0x0.st', detalhe: e.message } };
+      return { status: 500, data: { error: 'Falha ao fazer upload do PDF para catbox.moe', detalhe: e.message } };
     }
   }
 
@@ -836,7 +843,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.6.0',
+      version: '3.7.0',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
