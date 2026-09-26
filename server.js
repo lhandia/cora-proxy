@@ -763,28 +763,15 @@ async function handleTesseraProxy(payload) {
 
   const nomeArquivo = filename || `acordo-${(acordo_id || '').slice(-8)}.pdf`;
 
-  // ── Estratégia: upload do PDF para tmpfiles.org → enviar URL ao TesseraSign ──
-  // A plataforma Base44 stripa o campo "file" de TODOS os requests (JSON e multipart).
-  // O UploadPublicFile do próprio Base44 também falha pelo mesmo motivo.
-  // Solução: o proxy faz upload do PDF para tmpfiles.org (hospedagem temporária externa)
-  // e envia a URL pública ao TesseraSign no campo "file_url".
-  let pdfUrl = file_url || '';
-
-  if (!pdfUrl && pdf_base64) {
-    try {
-      const pdfBuffer = Buffer.from(pdf_base64, 'base64');
-      pdfUrl = await uploadToTmpfiles(pdfBuffer, nomeArquivo);
-      console.log('[tessera-proxy] PDF uploaded to:', pdfUrl);
-    } catch (e) {
-      return { status: 500, data: { error: 'Falha ao fazer upload do PDF para tmpfiles.org', detalhe: e.message } };
-    }
+  // ── Estratégia: enviar PDF como content_base64 no JSON diretamente ao TesseraSign ──
+  // O TesseraSign exige um objeto "document" com content_base64 + filename.
+  // É um campo JSON comum (não "file"), então o strip do Base44 não afeta.
+  // O proxy externo só repassa o JSON com o base64 intacto.
+  if (!pdf_base64 && !file_url) {
+    return { status: 400, data: { error: 'pdf_base64 ou file_url é obrigatório' } };
   }
 
-  if (!pdfUrl) {
-    return { status: 400, data: { error: 'file_url ou pdf_base64 é obrigatório' } };
-  }
-
-  const jsonBody = JSON.stringify({
+  const bodyObj = {
     reference_id: acordo_id || '',
     webhook_url: TESSERA_WEBHOOK_URL,
     source_system: 'Arcarius ERP',
@@ -797,9 +784,19 @@ async function handleTesseraProxy(payload) {
     }],
     message: mensagem || 'Por favor, assine o documento enviado pela Arcarius.',
     signature_type: 'advanced',
-    filename: nomeArquivo,
-    file_url: pdfUrl,
-  });
+  };
+
+  if (pdf_base64) {
+    bodyObj.document = {
+      content_base64: pdf_base64,
+      filename: nomeArquivo,
+    };
+  } else if (file_url) {
+    bodyObj.file_url = file_url;
+    bodyObj.filename = nomeArquivo;
+  }
+
+  const jsonBody = JSON.stringify(bodyObj);
 
   const result = await httpsRequest({
     hostname: 'tesserasign.base44.app',
@@ -852,7 +849,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.8.0',
+      version: '3.9.0',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
