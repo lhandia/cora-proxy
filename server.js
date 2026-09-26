@@ -726,7 +726,7 @@ async function handleTesseraProxy(payload) {
     message: mensagem || 'Por favor, assine o documento enviado pela Arcarius.',
     signature_type: 'advanced',
     filename: nomeArquivo,
-    file: {
+    document: {
       filename: nomeArquivo,
       content_base64: pdf_base64,
       content_type: 'application/pdf',
