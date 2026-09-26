@@ -700,19 +700,16 @@ const TESSERA_BASE_URL = 'https://tesserasign.base44.app';
 const TESSERA_WEBHOOK_URL = 'https://arcarius.base44.app/functions/webhookTesseraAssinatura';
 
 /**
- * Faz upload de um arquivo binário para catbox.moe (hospedagem gratuita, sem auth).
- * Retorna a URL pública do arquivo.
+ * Faz upload de um arquivo binário para tmpfiles.org (hospedagem gratuita, sem auth).
+ * Retorna a URL pública direta do arquivo.
  */
-function uploadToCatbox(pdfBuffer, filename) {
+function uploadToTmpfiles(pdfBuffer, filename) {
   return new Promise((resolve, reject) => {
-    const boundary = '----CatboxBoundary' + crypto.randomBytes(16).toString('hex');
+    const boundary = '----TmpfilesBoundary' + crypto.randomBytes(16).toString('hex');
     const parts = [];
 
-    // Campo reqtype=fileupload
-    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="reqtype"\r\n\r\nfileupload\r\n`, 'utf8'));
-
-    // Campo fileToUpload (binário)
-    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="fileToUpload"; filename="${filename}"\r\nContent-Type: application/pdf\r\n\r\n`, 'utf8'));
+    // Campo file (binário)
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: application/pdf\r\n\r\n`, 'utf8'));
     parts.push(pdfBuffer);
     parts.push(Buffer.from('\r\n', 'utf8'));
 
@@ -720,9 +717,9 @@ function uploadToCatbox(pdfBuffer, filename) {
     const body = Buffer.concat(parts);
 
     const req = https.request({
-      hostname: 'catbox.moe',
+      hostname: 'tmpfiles.org',
       port: 443,
-      path: '/user/api.php',
+      path: '/api/v1/upload',
       method: 'POST',
       headers: {
         'Content-Type': `multipart/form-data; boundary=${boundary}`,
@@ -732,15 +729,27 @@ function uploadToCatbox(pdfBuffer, filename) {
       let data = '';
       res.on('data', (chunk) => (data += chunk));
       res.on('end', () => {
-        if (res.statusCode === 200 && data.trim().startsWith('http')) {
-          resolve(data.trim());
+        if (res.statusCode === 200) {
+          try {
+            const json = JSON.parse(data);
+            const url = json?.data?.url || json?.url;
+            if (url) {
+              // Converte para URL de download direto: tmpfiles.org/xxx → tmpfiles.org/dl/xxx
+              const directUrl = url.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
+              resolve(directUrl);
+            } else {
+              reject(new Error(`tmpfiles.org: URL não encontrada na resposta: ${data}`));
+            }
+          } catch (e) {
+            reject(new Error(`tmpfiles.org: resposta inválida: ${data}`));
+          }
         } else {
-          reject(new Error(`catbox.moe retornou ${res.statusCode}: ${data}`));
+          reject(new Error(`tmpfiles.org retornou ${res.statusCode}: ${data}`));
         }
       });
     });
     req.on('error', reject);
-    req.setTimeout(30000, () => req.destroy(new Error('Timeout no upload para catbox.moe')));
+    req.setTimeout(30000, () => req.destroy(new Error('Timeout no upload para tmpfiles.org')));
     req.write(body);
     req.end();
   });
@@ -754,20 +763,20 @@ async function handleTesseraProxy(payload) {
 
   const nomeArquivo = filename || `acordo-${(acordo_id || '').slice(-8)}.pdf`;
 
-  // ── Estratégia: upload do PDF para 0x0.st → enviar URL ao TesseraSign ──
+  // ── Estratégia: upload do PDF para tmpfiles.org → enviar URL ao TesseraSign ──
   // A plataforma Base44 stripa o campo "file" de TODOS os requests (JSON e multipart).
   // O UploadPublicFile do próprio Base44 também falha pelo mesmo motivo.
-  // Solução: o proxy faz upload do PDF para 0x0.st (hospedagem temporária externa)
+  // Solução: o proxy faz upload do PDF para tmpfiles.org (hospedagem temporária externa)
   // e envia a URL pública ao TesseraSign no campo "file_url".
   let pdfUrl = file_url || '';
 
   if (!pdfUrl && pdf_base64) {
     try {
       const pdfBuffer = Buffer.from(pdf_base64, 'base64');
-      pdfUrl = await uploadToCatbox(pdfBuffer, nomeArquivo);
+      pdfUrl = await uploadToTmpfiles(pdfBuffer, nomeArquivo);
       console.log('[tessera-proxy] PDF uploaded to:', pdfUrl);
     } catch (e) {
-      return { status: 500, data: { error: 'Falha ao fazer upload do PDF para catbox.moe', detalhe: e.message } };
+      return { status: 500, data: { error: 'Falha ao fazer upload do PDF para tmpfiles.org', detalhe: e.message } };
     }
   }
 
@@ -843,7 +852,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.7.0',
+      version: '3.8.0',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
