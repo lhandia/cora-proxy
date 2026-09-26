@@ -709,8 +709,8 @@ async function handleTesseraProxy(payload) {
   const nomeArquivo = filename || `acordo-${(acordo_id || '').slice(-8)}.pdf`;
 
   // O TesseraSign também roda no Base44, que força JSON em /functions/ e stripa o campo "file".
-  // Tentativa: enviar o base64 como string no campo "file" (Base44 pode stripar só objetos/binários).
-  // Fallback: também envia em "document" e "file_base64" caso a função TesseraSign aceite nomes alternativos.
+  // Base44 stripa "file" independente do tipo (string, objeto, binário).
+  // Tentativa: passar URL do PDF (que já está no storage público) em vez do conteúdo base64.
   const jsonBody = JSON.stringify({
     reference_id: acordo_id || '',
     webhook_url: TESSERA_WEBHOOK_URL,
@@ -724,13 +724,15 @@ async function handleTesseraProxy(payload) {
     }],
     message: mensagem || 'Por favor, assine o documento enviado pela Arcarius.',
     signature_type: 'advanced',
-    file: pdf_base64,
-    file_base64: pdf_base64,
     filename: nomeArquivo,
+    file_url: payload.file_url || undefined,
+    document_url: payload.file_url || undefined,
+    url: payload.file_url || undefined,
     document: {
       filename: nomeArquivo,
       content_base64: pdf_base64,
       content_type: 'application/pdf',
+      url: payload.file_url || undefined,
     },
   });
 
