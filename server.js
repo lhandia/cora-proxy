@@ -699,6 +699,46 @@ async function handleSerproProxy(payload) {
 const TESSERA_BASE_URL = 'https://tesserasign.base44.app';
 const TESSERA_WEBHOOK_URL = 'https://arcarius.base44.app/functions/webhookTesseraAssinatura';
 
+/**
+ * Faz upload de um arquivo binário para 0x0.st (hospedagem temporária gratuita).
+ * Retorna a URL pública do arquivo.
+ */
+function uploadTo0x0st(pdfBuffer, filename) {
+  return new Promise((resolve, reject) => {
+    const boundary = '----UploadBoundary' + crypto.randomBytes(16).toString('hex');
+    const parts = [];
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: application/pdf\r\n\r\n`, 'utf8'));
+    parts.push(pdfBuffer);
+    parts.push(Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'));
+    const body = Buffer.concat(parts);
+
+    const req = https.request({
+      hostname: '0x0.st',
+      port: 443,
+      path: '/',
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': body.length,
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => {
+        if (res.statusCode === 200 && data.trim()) {
+          resolve(data.trim());
+        } else {
+          reject(new Error(`0x0.st retornou ${res.statusCode}: ${data}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(30000, () => req.destroy(new Error('Timeout no upload para 0x0.st')));
+    req.write(body);
+    req.end();
+  });
+}
+
 async function handleTesseraProxy(payload) {
   const { tessera_api_key, pdf_base64, filename, signatario, mensagem, acordo_id, file_url } = payload;
 
@@ -707,11 +747,24 @@ async function handleTesseraProxy(payload) {
 
   const nomeArquivo = filename || `acordo-${(acordo_id || '').slice(-8)}.pdf`;
 
-  // ── Estratégia: enviar JSON com file_url (URL pública do PDF) ──
+  // ── Estratégia: upload do PDF para 0x0.st → enviar URL ao TesseraSign ──
   // A plataforma Base44 stripa o campo "file" de TODOS os requests (JSON e multipart).
-  // Como o TesseraSign é um app Base44, não conseguimos enviar "file" diretamente.
-  // Solução: upload do PDF para storage público → enviar URL no campo "file_url".
-  if (!file_url && !pdf_base64) {
+  // O UploadPublicFile do próprio Base44 também falha pelo mesmo motivo.
+  // Solução: o proxy faz upload do PDF para 0x0.st (hospedagem temporária externa)
+  // e envia a URL pública ao TesseraSign no campo "file_url".
+  let pdfUrl = file_url || '';
+
+  if (!pdfUrl && pdf_base64) {
+    try {
+      const pdfBuffer = Buffer.from(pdf_base64, 'base64');
+      pdfUrl = await uploadTo0x0st(pdfBuffer, nomeArquivo);
+      console.log('[tessera-proxy] PDF uploaded to:', pdfUrl);
+    } catch (e) {
+      return { status: 500, data: { error: 'Falha ao fazer upload do PDF para 0x0.st', detalhe: e.message } };
+    }
+  }
+
+  if (!pdfUrl) {
     return { status: 400, data: { error: 'file_url ou pdf_base64 é obrigatório' } };
   }
 
@@ -729,13 +782,7 @@ async function handleTesseraProxy(payload) {
     message: mensagem || 'Por favor, assine o documento enviado pela Arcarius.',
     signature_type: 'advanced',
     filename: nomeArquivo,
-    file_url: file_url || null,
-    file_base64: pdf_base64 || null,
-    document: pdf_base64 ? {
-      filename: nomeArquivo,
-      content_base64: pdf_base64,
-      content_type: 'application/pdf',
-    } : null,
+    file_url: pdfUrl,
   });
 
   const result = await httpsRequest({
@@ -789,7 +836,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.5.0',
+      version: '3.6.0',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
