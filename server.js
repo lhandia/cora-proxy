@@ -763,40 +763,50 @@ async function handleTesseraProxy(payload) {
 
   const nomeArquivo = filename || `acordo-${(acordo_id || '').slice(-8)}.pdf`;
 
-  // ── Estratégia: enviar PDF como content_base64 no JSON diretamente ao TesseraSign ──
-  // O TesseraSign exige um objeto "document" com content_base64 + filename.
-  // É um campo JSON comum (não "file"), então o strip do Base44 não afeta.
-  // O proxy externo só repassa o JSON com o base64 intacto.
+  // ── Estratégia: enviar PDF como multipart/form-data com campo "file" ──
+  // O TesseraSign exige o PDF no campo "file" como multipart/form-data.
+  // O proxy externo (Node.js) envia multipart nativo — sem strip do Base44.
   if (!pdf_base64 && !file_url) {
     return { status: 400, data: { error: 'pdf_base64 ou file_url é obrigatório' } };
   }
 
-  const bodyObj = {
+  const signersJson = JSON.stringify([{
+    name: signatario.nome,
+    email: signatario.email,
+    cpf: signatario.cpf || undefined,
+    phone: signatario.whatsapp || signatario.telefone || undefined,
+    action: 'sign',
+  }]);
+
+  // Monta multipart/form-data manualmente
+  const boundary = '----TesseraBoundary' + crypto.randomBytes(16).toString('hex');
+  const parts = [];
+
+  // Campos de texto
+  const textFields = {
     reference_id: acordo_id || '',
     webhook_url: TESSERA_WEBHOOK_URL,
     source_system: 'Arcarius ERP',
-    signers: [{
-      name: signatario.nome,
-      email: signatario.email,
-      cpf: signatario.cpf || undefined,
-      phone: signatario.whatsapp || signatario.telefone || undefined,
-      action: 'sign',
-    }],
+    signers: signersJson,
     message: mensagem || 'Por favor, assine o documento enviado pela Arcarius.',
     signature_type: 'advanced',
   };
+  if (file_url) textFields.file_url = file_url;
 
-  if (pdf_base64) {
-    bodyObj.document = {
-      content_base64: pdf_base64,
-      filename: nomeArquivo,
-    };
-  } else if (file_url) {
-    bodyObj.file_url = file_url;
-    bodyObj.filename = nomeArquivo;
+  for (const [key, val] of Object.entries(textFields)) {
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${val}\r\n`, 'utf8'));
   }
 
-  const jsonBody = JSON.stringify(bodyObj);
+  // Campo file (binário PDF)
+  if (pdf_base64) {
+    const pdfBuffer = Buffer.from(pdf_base64, 'base64');
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${nomeArquivo}"\r\nContent-Type: application/pdf\r\n\r\n`, 'utf8'));
+    parts.push(pdfBuffer);
+    parts.push(Buffer.from('\r\n', 'utf8'));
+  }
+
+  parts.push(Buffer.from(`--${boundary}--\r\n`, 'utf8'));
+  const body = Buffer.concat(parts);
 
   const result = await httpsRequest({
     hostname: 'tesserasign.base44.app',
@@ -804,10 +814,10 @@ async function handleTesseraProxy(payload) {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${tessera_api_key}`,
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(jsonBody, 'utf8'),
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      'Content-Length': body.length,
     },
-    body: jsonBody,
+    body,
   });
 
   let responseData;
@@ -849,7 +859,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.9.0',
+      version: '3.10.0',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
