@@ -708,43 +708,27 @@ async function handleTesseraProxy(payload) {
 
   const nomeArquivo = filename || `acordo-${(acordo_id || '').slice(-8)}.pdf`;
 
-  // Construir multipart/form-data manualmente
-  const boundary = '----ArcariusTessera' + crypto.randomBytes(8).toString('hex');
-  const parts = [];
-
-  const addField = (name, value) => {
-    parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`);
-  };
-
-  addField('reference_id', acordo_id || '');
-  addField('webhook_url', TESSERA_WEBHOOK_URL);
-  addField('source_system', 'Arcarius ERP');
-  addField('signers', JSON.stringify([{
-    name: signatario.nome,
-    email: signatario.email,
-    cpf: signatario.cpf || undefined,
-    phone: signatario.whatsapp || signatario.telefone || undefined,
-    action: 'sign',
-  }]));
-  addField('message', mensagem || 'Por favor, assine o documento enviado pela Arcarius.');
-  addField('signature_type', 'advanced');
-
-  // Campo file — PDF binário real (decodifica base64 → bytes)
-  const pdfBuffer = Buffer.from(pdf_base64, 'base64');
-  const fileHeader = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${nomeArquivo}"\r\nContent-Type: application/pdf\r\n\r\n`;
-  const fileFooter = `\r\n`;
-  const closingBoundary = `--${boundary}--\r\n`;
-
-  // Constrói o body multipart como Buffer (mistura strings UTF-8 e bytes binários do PDF)
-  const bodyParts = [];
-  for (const part of parts) {
-    bodyParts.push(Buffer.from(part, 'utf8'));
-  }
-  bodyParts.push(Buffer.from(fileHeader, 'utf8'));
-  bodyParts.push(pdfBuffer);
-  bodyParts.push(Buffer.from(fileFooter, 'utf8'));
-  bodyParts.push(Buffer.from(closingBoundary, 'utf8'));
-  const bodyBuffer = Buffer.concat(bodyParts);
+  // O TesseraSign também roda no Base44, que força JSON em /functions/ e stripa o campo "file".
+  // Solução: enviar JSON com o PDF em base64 dentro de um campo "document" (não stripado).
+  const jsonBody = JSON.stringify({
+    reference_id: acordo_id || '',
+    webhook_url: TESSERA_WEBHOOK_URL,
+    source_system: 'Arcarius ERP',
+    signers: [{
+      name: signatario.nome,
+      email: signatario.email,
+      cpf: signatario.cpf || undefined,
+      phone: signatario.whatsapp || signatario.telefone || undefined,
+      action: 'sign',
+    }],
+    message: mensagem || 'Por favor, assine o documento enviado pela Arcarius.',
+    signature_type: 'advanced',
+    document: {
+      filename: nomeArquivo,
+      content_base64: pdf_base64,
+      content_type: 'application/pdf',
+    },
+  });
 
   const result = await httpsRequest({
     hostname: 'tesserasign.base44.app',
@@ -752,10 +736,10 @@ async function handleTesseraProxy(payload) {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${tessera_api_key}`,
-      'Content-Type': `multipart/form-data; boundary=${boundary}`,
-      'Content-Length': bodyBuffer.length,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(jsonBody, 'utf8'),
     },
-    body: bodyBuffer,
+    body: jsonBody,
   });
 
   let responseData;
