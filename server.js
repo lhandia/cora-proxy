@@ -799,9 +799,9 @@ async function handleTesseraProxy(payload) {
     }],
     message: mensagem || 'Por favor, assine o documento enviado pela Arcarius.',
     signature_type: 'advanced',
-    file: pdfPublicUrl, // URL string — funciona com validação antiga (file não-vazio)
+    file: { url: pdfPublicUrl, filename: nomeArquivo }, // objeto aninhado — testa se middleware stripa sub-fields
     document: {
-      url: pdfPublicUrl, // URL pública — funciona com validação nova (document.url)
+      url: pdfPublicUrl,
       filename: nomeArquivo,
     },
   };
@@ -874,7 +874,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.19.0',
+      version: '3.19.1',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
