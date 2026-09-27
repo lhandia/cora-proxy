@@ -767,10 +767,9 @@ async function handleTesseraProxy(payload) {
     return { status: 400, data: { error: 'pdf_base64 ou file_url é obrigatório' } };
   }
 
-  // ── Estratégia v3.15.0: JSON com file (URL string) + document.encoded_data (base64) ──
-  // O TesseraSign API só aceita JSON. O Base44 middleware stripa 'file' de requests internos.
-  // Mas o proxy é externo (Railway) — o middleware NÃO stripa strings URL de requests externos.
-  // v3.14.0 confirmou: file como URL string passa. Agora enviamos também document.encoded_data.
+  // ── Estratégia v3.16.0: JSON com document.url (URL pública do PDF) ──
+  // O TesseraSign publicApi agora aceita document.url como alternativa ao base64.
+  // O proxy sobe o PDF pra tmpfiles.org e envia só a URL — sem base64, sem bloqueio de middleware.
   let pdfPublicUrl = file_url;
 
   if (!pdfPublicUrl && pdf_base64) {
@@ -795,9 +794,8 @@ async function handleTesseraProxy(payload) {
     }],
     message: mensagem || 'Por favor, assine o documento enviado pela Arcarius.',
     signature_type: 'advanced',
-    file: pdfPublicUrl, // URL string — passa pelo middleware (não é base64)
     document: {
-      encoded_data: pdf_base64 || '', // base64 do PDF
+      url: pdfPublicUrl, // URL pública do PDF — TesseraSign faz fetch() e baixa
       filename: nomeArquivo,
     },
   };
@@ -860,7 +858,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.15.0',
+      version: '3.16.0',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
