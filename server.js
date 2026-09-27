@@ -756,10 +756,15 @@ function uploadToTmpfiles(pdfBuffer, filename) {
 }
 
 async function handleTesseraProxy(payload) {
-  const { tessera_api_key, pdf_base64, filename, signatario, mensagem, acordo_id, file_url } = payload;
+  const { tessera_api_key, pdf_base64, filename, signatario, signatarios, mensagem, acordo_id, file_url, signature_type } = payload;
 
   if (!tessera_api_key) return { status: 400, data: { error: 'tessera_api_key é obrigatória' } };
-  if (!signatario?.nome || !signatario?.email) return { status: 400, data: { error: 'signatario.nome e signatario.email são obrigatórios' } };
+
+  // Suporta signatarios (array) ou signatario (objeto único, retrocompatível)
+  const signers = signatarios || (signatario ? [signatario] : []);
+  if (!signers.length || signers.some(s => !s?.nome || !s?.email)) {
+    return { status: 400, data: { error: 'signatarios (array) ou signatario com nome+email são obrigatórios' } };
+  }
 
   const nomeArquivo = filename || `acordo-${(acordo_id || '').slice(-8)}.pdf`;
 
@@ -767,12 +772,12 @@ async function handleTesseraProxy(payload) {
     return { status: 400, data: { error: 'pdf_base64 ou file_url é obrigatório' } };
   }
 
-  // ── Estratégia v3.23.0: multipart/form-data com arquivo binário ──
-  // O base64 em JSON resultava em PDF em branco no TesseraSign (decodificação incorreta
-  // da publicApi). Agora enviamos multipart/form-data padrão — o mesmo formato que
-  // um upload de formulário web. O TesseraSign recebe um File real via req.formData(),
-  // sem precisar decodificar base64. O middleware do Base44 não intercepta files
-  // em multipart/form-data (só intercepta campos JSON com valores URL).
+  // ── v3.24.0: FormData nativo do Node.js 18 ──
+  // v3.23.0 montava o multipart manualmente com Buffer.concat — o PDF chegava
+  // em branco no TesseraSign (encoding do boundary/body corrompido ao usar
+  // fetch com Buffer bruto). v3.24.0 usa FormData + Blob nativos, delegando
+  // a codificação multipart ao undici (motor do fetch). Isso garante que o
+  // binário do PDF chegue íntegro ao TesseraSign via req.formData().
   let pdfBuffer;
   if (pdf_base64) {
     pdfBuffer = Buffer.from(pdf_base64, 'base64');
@@ -792,48 +797,34 @@ async function handleTesseraProxy(payload) {
     return { status: 400, data: { error: 'PDF vazio — base64 ou URL inválida' } };
   }
 
-  // Monta o multipart/form-data manualmente (Node.js 18 não tem FormData nativa com append de Buffer)
-  const boundary = '----TesseraBoundary' + crypto.randomBytes(16).toString('hex');
-  const parts = [];
+  // FormData nativo (Node.js 18+) — undici cuida do boundary e encoding
+  const formData = new FormData();
+  formData.append('reference_id', acordo_id || '');
+  formData.append('source_system', 'Arcarius ERP');
+  formData.append('signers', JSON.stringify(signers.map(s => ({
+    name: s.nome,
+    email: s.email,
+    cpf: s.cpf || undefined,
+    phone: s.whatsapp || s.telefone || undefined,
+    action: s.action || 'sign',
+  })).filter(s => s)));
+  formData.append('message', mensagem || 'Por favor, assine o documento enviado pela Arcarius.');
+  formData.append('signature_type', signature_type || 'advanced');
+  // Anexa o PDF como Blob — undici codifica como file multipart (com filename)
+  formData.append('file', new Blob([new Uint8Array(pdfBuffer)], { type: 'application/pdf' }), nomeArquivo);
 
-  // Função helper: adiciona um campo texto
-  const addField = (name, value) => {
-    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, 'utf8'));
-  };
-
-  addField('reference_id', acordo_id || '');
-  addField('source_system', 'Arcarius ERP');
-  addField('signers', JSON.stringify([{
-    name: signatario.nome,
-    email: signatario.email,
-    cpf: signatario.cpf || undefined,
-    phone: signatario.whatsapp || signatario.telefone || undefined,
-    action: 'sign',
-  }].filter(s => s)));
-  addField('message', mensagem || 'Por favor, assine o documento enviado pela Arcarius.');
-  addField('signature_type', 'advanced');
-
-  // Campo file (binário PDF)
-  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${nomeArquivo}"\r\nContent-Type: application/pdf\r\n\r\n`, 'utf8'));
-  parts.push(pdfBuffer);
-  parts.push(Buffer.from('\r\n', 'utf8'));
-
-  // Fecha o multipart
-  parts.push(Buffer.from(`--${boundary}--\r\n`, 'utf8'));
-  const multipartBody = Buffer.concat(parts);
-
-  // Modo debug: retorna info sem enviar
+  // Modo debug
   if (payload.debug) {
-    return { status: 200, data: { debug: true, pdf_size: pdfBuffer.length, boundary, content_type: `multipart/form-data; boundary=${boundary}` } };
+    return { status: 200, data: { debug: true, pdf_size: pdfBuffer.length, signers_count: signers.length, signature_type: signature_type || 'advanced' } };
   }
 
+  // Não definir Content-Type manualmente — undici define automaticamente com o boundary correto
   const fetchResp = await fetch('https://tesserasign.base44.app/functions/publicApi', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${tessera_api_key}`,
-      'Content-Type': `multipart/form-data; boundary=${boundary}`,
     },
-    body: multipartBody,
+    body: formData,
   });
 
   const respText = await fetchResp.text();
@@ -880,7 +871,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.23.0',
+      version: '3.24.0',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
