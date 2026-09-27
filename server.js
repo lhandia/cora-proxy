@@ -767,10 +767,14 @@ async function handleTesseraProxy(payload) {
     return { status: 400, data: { error: 'pdf_base64 ou file_url é obrigatório' } };
   }
 
-  // ── Estratégia v3.18.0: SÓ document.url + document.filename (sem file) ──
-  // A publicApi do TesseraSign foi atualizada: checa document.url e document.encoded_data
-  // PRIMEIRO, antes do file. O file nunca chega intacto (middleware do Base44 stripa),
-  // então não enviamos file — só document.url. O TesseraSign faz fetch(url) e baixa o PDF.
+  // ── Estratégia v3.19.0: Content-Type: text/plain + file (URL) + document.url ──
+  // O middleware do Base44 stripa o campo "file" de JSON bodies (Content-Type: application/json).
+  // Enviando com Content-Type: text/plain, o middleware NÃO parseia o body como JSON,
+  // então o campo "file" chega intacto ao TesseraSign. O Deno (req.json()) parseia
+  // o body como JSON independente do Content-Type, então a publicApi funciona.
+  // Incluímos ambos file (URL string) e document.url — funciona com código antigo E novo:
+  //  - Código antigo: checa file primeiro → file é URL string (não vazio) → passa → usa file
+  //  - Código novo: checa document.url primeiro → usa document.url
   let pdfPublicUrl = file_url;
 
   if (!pdfPublicUrl && pdf_base64) {
@@ -795,8 +799,9 @@ async function handleTesseraProxy(payload) {
     }],
     message: mensagem || 'Por favor, assine o documento enviado pela Arcarius.',
     signature_type: 'advanced',
+    file: pdfPublicUrl, // URL string — funciona com validação antiga (file não-vazio)
     document: {
-      url: pdfPublicUrl, // URL pública — TesseraSign faz fetch() e baixa o PDF
+      url: pdfPublicUrl, // URL pública — funciona com validação nova (document.url)
       filename: nomeArquivo,
     },
   };
@@ -813,13 +818,13 @@ async function handleTesseraProxy(payload) {
     return { status: 200, data: { debug: true, payload_sent: jsonBody, body_str: bodyStr } };
   }
 
-  // v3.18.1: usa fetch nativo (undici) em vez de https.request
-  // O sandbox Base44 usa fetch e funciona; https.request pode enviar headers diferentes
+  // v3.19.0: Content-Type: text/plain para bypassar o middleware do Base44 que stripa "file"
+  // O Deno (req.json()) parseia o body como JSON independente do Content-Type.
   const fetchResp = await fetch('https://tesserasign.base44.app/functions/publicApi', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${tessera_api_key}`,
-      'Content-Type': 'application/json',
+      'Content-Type': 'text/plain',
     },
     body: bodyStr,
   });
@@ -869,7 +874,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.18.1',
+      version: '3.19.0',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
