@@ -767,10 +767,10 @@ async function handleTesseraProxy(payload) {
     return { status: 400, data: { error: 'pdf_base64 ou file_url é obrigatório' } };
   }
 
-  // ── Estratégia v3.17.0: file (URL string) + document.url + document.filename ──
-  // O TesseraSign valida 'file' primeiro. Se ausente → erro "file field is an empty object".
-  // Enviar file como URL string passa na validação do file (v3.14.0 confirmou).
-  // Depois, document.url ativa o novo caminho: TesseraSign faz fetch(url) e baixa o PDF.
+  // ── Estratégia v3.18.0: SÓ document.url + document.filename (sem file) ──
+  // A publicApi do TesseraSign foi atualizada: checa document.url e document.encoded_data
+  // PRIMEIRO, antes do file. O file nunca chega intacto (middleware do Base44 stripa),
+  // então não enviamos file — só document.url. O TesseraSign faz fetch(url) e baixa o PDF.
   let pdfPublicUrl = file_url;
 
   if (!pdfPublicUrl && pdf_base64) {
@@ -795,7 +795,6 @@ async function handleTesseraProxy(payload) {
     }],
     message: mensagem || 'Por favor, assine o documento enviado pela Arcarius.',
     signature_type: 'advanced',
-    file: pdfPublicUrl, // URL string — passa na validação do 'file'
     document: {
       url: pdfPublicUrl, // URL pública — TesseraSign faz fetch() e baixa o PDF
       filename: nomeArquivo,
@@ -808,6 +807,11 @@ async function handleTesseraProxy(payload) {
   );
 
   const bodyStr = JSON.stringify(jsonBody);
+
+  // Modo debug: retorna o payload sem enviar ao TesseraSign
+  if (payload.debug) {
+    return { status: 200, data: { debug: true, payload_sent: jsonBody, body_str: bodyStr } };
+  }
 
   const result = await httpsRequest({
     hostname: 'tesserasign.base44.app',
@@ -823,6 +827,11 @@ async function handleTesseraProxy(payload) {
 
   let responseData;
   try { responseData = JSON.parse(result.body); } catch { responseData = result.body; }
+
+  // Inclui o payload enviado na resposta para debug quando há erro
+  if (result.status >= 400) {
+    return { status: result.status, data: { ...responseData, _debug_payload: jsonBody } };
+  }
 
   return { status: result.status, data: responseData };
 }
@@ -860,7 +869,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.17.0',
+      version: '3.18.0',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
