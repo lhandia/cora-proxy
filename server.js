@@ -767,12 +767,12 @@ async function handleTesseraProxy(payload) {
     return { status: 400, data: { error: 'pdf_base64 ou file_url é obrigatório' } };
   }
 
-  // ── Estratégia v3.18.0: SÓ document.url + document.filename (sem file) ──
-  // O middleware do Base44 stripa o campo "file" de TODOS os requests (JSON, text/plain,
-  // objeto aninhado — testado em v3.19.0 e v3.19.1, todos stripados para {}).
-  // Solução: NÃO enviar file — só document.url. A publicApi atualizada do TesseraSign
-  // checa document.url PRIMEIRO e faz fetch(url) para baixar o PDF.
-  // Requisito: a publicApi atualizada precisa estar propagada em TODAS as instâncias.
+  // ── Estratégia v3.20.0: document.pdf_url (campo renomeado) ──
+  // O middleware do Base44 intercepta qualquer campo JSON chamado "url" que contenha
+  // uma URL HTTP válida (que retorna 200) — baixa o arquivo, tenta injetar como upload
+  // multipart, e bloqueia o request com "file field is an empty object".
+  // Solução: renomear o campo para "pdf_url" — o middleware não intercepta campos com
+  // outros nomes. A publicApi do TesseraSign foi atualizada para aceitar document.pdf_url.
   let pdfPublicUrl = file_url;
 
   if (!pdfPublicUrl && pdf_base64) {
@@ -798,7 +798,7 @@ async function handleTesseraProxy(payload) {
     message: mensagem || 'Por favor, assine o documento enviado pela Arcarius.',
     signature_type: 'advanced',
     document: {
-      url: pdfPublicUrl,
+      pdf_url: pdfPublicUrl,
       filename: nomeArquivo,
     },
   };
@@ -869,7 +869,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.18.0',
+      version: '3.20.0',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
