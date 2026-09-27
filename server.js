@@ -767,14 +767,12 @@ async function handleTesseraProxy(payload) {
     return { status: 400, data: { error: 'pdf_base64 ou file_url é obrigatório' } };
   }
 
-  // ── Estratégia v3.19.0: Content-Type: text/plain + file (URL) + document.url ──
-  // O middleware do Base44 stripa o campo "file" de JSON bodies (Content-Type: application/json).
-  // Enviando com Content-Type: text/plain, o middleware NÃO parseia o body como JSON,
-  // então o campo "file" chega intacto ao TesseraSign. O Deno (req.json()) parseia
-  // o body como JSON independente do Content-Type, então a publicApi funciona.
-  // Incluímos ambos file (URL string) e document.url — funciona com código antigo E novo:
-  //  - Código antigo: checa file primeiro → file é URL string (não vazio) → passa → usa file
-  //  - Código novo: checa document.url primeiro → usa document.url
+  // ── Estratégia v3.18.0: SÓ document.url + document.filename (sem file) ──
+  // O middleware do Base44 stripa o campo "file" de TODOS os requests (JSON, text/plain,
+  // objeto aninhado — testado em v3.19.0 e v3.19.1, todos stripados para {}).
+  // Solução: NÃO enviar file — só document.url. A publicApi atualizada do TesseraSign
+  // checa document.url PRIMEIRO e faz fetch(url) para baixar o PDF.
+  // Requisito: a publicApi atualizada precisa estar propagada em TODAS as instâncias.
   let pdfPublicUrl = file_url;
 
   if (!pdfPublicUrl && pdf_base64) {
@@ -799,7 +797,6 @@ async function handleTesseraProxy(payload) {
     }],
     message: mensagem || 'Por favor, assine o documento enviado pela Arcarius.',
     signature_type: 'advanced',
-    file: { url: pdfPublicUrl, filename: nomeArquivo }, // objeto aninhado — testa se middleware stripa sub-fields
     document: {
       url: pdfPublicUrl,
       filename: nomeArquivo,
@@ -818,13 +815,11 @@ async function handleTesseraProxy(payload) {
     return { status: 200, data: { debug: true, payload_sent: jsonBody, body_str: bodyStr } };
   }
 
-  // v3.19.0: Content-Type: text/plain para bypassar o middleware do Base44 que stripa "file"
-  // O Deno (req.json()) parseia o body como JSON independente do Content-Type.
   const fetchResp = await fetch('https://tesserasign.base44.app/functions/publicApi', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${tessera_api_key}`,
-      'Content-Type': 'text/plain',
+      'Content-Type': 'application/json',
     },
     body: bodyStr,
   });
@@ -874,7 +869,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.19.1',
+      version: '3.18.0',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
