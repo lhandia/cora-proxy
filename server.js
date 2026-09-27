@@ -767,26 +767,39 @@ async function handleTesseraProxy(payload) {
     return { status: 400, data: { error: 'pdf_base64 ou file_url é obrigatório' } };
   }
 
-  // ── Estratégia v3.20.0: document.pdf_url (campo renomeado) ──
-  // O middleware do Base44 intercepta qualquer campo JSON chamado "url" que contenha
-  // uma URL HTTP válida (que retorna 200) — baixa o arquivo, tenta injetar como upload
-  // multipart, e bloqueia o request com "file field is an empty object".
-  // Solução: renomear o campo para "pdf_url" — o middleware não intercepta campos com
-  // outros nomes. A publicApi do TesseraSign foi atualizada para aceitar document.pdf_url.
-  let pdfPublicUrl = file_url;
+  // ── Estratégia v3.21.0: webhook_endpoint + document.encoded_data ──
+  // O middleware do Base44 intercepta QUALQUER campo JSON cujo nome TERMINA com "url"
+  // e que contenha uma URL HTTP válida (que retorna 200). Isso afeta:
+  //   - webhook_url → interceptado → cria "file" vazio → "file field is an empty object"
+  //   - document.pdf_url → também interceptado pelo mesmo motivo
+  // Solução: renomear TODOS os campos terminados em "url" para nomes alternativos:
+  //   - webhook_url → webhook_endpoint
+  //   - document.pdf_url → document.encoded_data (base64 direto, sem hospedagem externa)
+  // Nenhum campo do payload termina com "url" → middleware não intercepta nada.
+  const pdfBase64Data = pdf_base64;
 
-  if (!pdfPublicUrl && pdf_base64) {
-    const pdfBuffer = Buffer.from(pdf_base64, 'base64');
+  if (!pdfBase64Data && !file_url) {
+    return { status: 400, data: { error: 'pdf_base64 ou file_url é obrigatório' } };
+  }
+
+  // Se só temos file_url (URL pública), baixa o PDF e converte para base64
+  let encodedData = pdfBase64Data;
+  if (!encodedData && file_url) {
     try {
-      pdfPublicUrl = await uploadToTmpfiles(pdfBuffer, nomeArquivo);
+      const downloadResp = await fetch(file_url);
+      if (!downloadResp.ok) {
+        return { status: 502, data: { error: `Falha ao baixar PDF da URL: ${downloadResp.status}` } };
+      }
+      const buffer = Buffer.from(await downloadResp.arrayBuffer());
+      encodedData = buffer.toString('base64');
     } catch (e) {
-      return { status: 502, data: { error: 'Falha ao hospedar PDF: ' + e.message } };
+      return { status: 502, data: { error: 'Falha ao baixar PDF: ' + e.message } };
     }
   }
 
   const jsonBody = {
     reference_id: acordo_id || '',
-    webhook_url: TESSERA_WEBHOOK_URL,
+    webhook_endpoint: TESSERA_WEBHOOK_URL,
     source_system: 'Arcarius ERP',
     signers: [{
       name: signatario.nome,
@@ -798,7 +811,7 @@ async function handleTesseraProxy(payload) {
     message: mensagem || 'Por favor, assine o documento enviado pela Arcarius.',
     signature_type: 'advanced',
     document: {
-      pdf_url: pdfPublicUrl,
+      encoded_data: encodedData,
       filename: nomeArquivo,
     },
   };
@@ -869,7 +882,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.20.0',
+      version: '3.21.0',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
