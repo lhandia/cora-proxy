@@ -799,7 +799,9 @@ async function handleTesseraProxy(payload) {
 
   const jsonBody = {
     reference_id: acordo_id || '',
-    webhook_endpoint: TESSERA_WEBHOOK_URL,
+    // webhook_endpoint REMOVIDO — o middleware do Base44 intercepta qualquer campo
+    // que contenha uma URL, independentemente do nome. A publicApi do TesseraSign
+    // deve hardcodar a URL do webhook (sempre a mesma: arcarius.base44.app/functions/webhookTesseraAssinatura).
     source_system: 'Arcarius ERP',
     signers: [{
       name: signatario.nome,
@@ -882,7 +884,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.21.0',
+      version: '3.22.0',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
