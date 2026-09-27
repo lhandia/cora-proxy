@@ -813,27 +813,27 @@ async function handleTesseraProxy(payload) {
     return { status: 200, data: { debug: true, payload_sent: jsonBody, body_str: bodyStr } };
   }
 
-  const result = await httpsRequest({
-    hostname: 'tesserasign.base44.app',
-    path: '/functions/publicApi',
+  // v3.18.1: usa fetch nativo (undici) em vez de https.request
+  // O sandbox Base44 usa fetch e funciona; https.request pode enviar headers diferentes
+  const fetchResp = await fetch('https://tesserasign.base44.app/functions/publicApi', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${tessera_api_key}`,
       'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(bodyStr),
     },
     body: bodyStr,
   });
 
+  const respText = await fetchResp.text();
   let responseData;
-  try { responseData = JSON.parse(result.body); } catch { responseData = result.body; }
+  try { responseData = JSON.parse(respText); } catch { responseData = respText; }
 
   // Inclui o payload enviado na resposta para debug quando há erro
-  if (result.status >= 400) {
-    return { status: result.status, data: { ...responseData, _debug_payload: jsonBody } };
+  if (!fetchResp.ok) {
+    return { status: fetchResp.status, data: { ...responseData, _debug_payload: jsonBody } };
   }
 
-  return { status: result.status, data: responseData };
+  return { status: fetchResp.status, data: responseData };
 }
 
 // ═══════════════════════ SERVIDOR HTTP ═══════════════════════
@@ -869,7 +869,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.18.0',
+      version: '3.18.1',
       endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
