@@ -436,6 +436,69 @@ function mTlsRequestPfx({ hostname, path, method, headers, body, pfx, passphrase
   });
 }
 
+// ═══════════════════════ ADN NFS-e NACIONAL mTLS PROXY ═══════════════════════
+// O Ambiente de Dados Nacional (ADN) da NFS-e exige mTLS com certificado e-CNPJ.
+// Este endpoint expõe a consulta de DF-e por NSU: GET /contribuintes/DFe/{NSU}.
+
+function mTlsRequestPfxRaw({ hostname, path, method, headers, pfx, passphrase }) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname,
+        port: 443,
+        path,
+        method: method || 'GET',
+        headers: headers || {},
+        pfx,
+        passphrase,
+        rejectUnauthorized: true,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () =>
+          resolve({ status: res.statusCode, bodyBase64: Buffer.concat(chunks).toString('base64') }),
+        );
+      },
+    );
+    req.on('error', reject);
+    req.setTimeout(60000, () => req.destroy(new Error('Timeout na requisição ao ADN')));
+    req.end();
+  });
+}
+
+async function handleAdnProxy(payload) {
+  const { cert_pfx_base64, cert_senha, path: adnPath, hostname } = payload || {};
+  if (!cert_pfx_base64 || !adnPath) {
+    return { status: 400, data: { error: 'cert_pfx_base64 e path são obrigatórios' } };
+  }
+  const pfxBuffer = Buffer.from(cert_pfx_base64, 'base64');
+  try {
+    require('tls').createSecureContext({ pfx: pfxBuffer, passphrase: cert_senha });
+  } catch (e) {
+    return {
+      status: 400,
+      data: {
+        error: 'Certificado PFX não pôde ser carregado',
+        detalhe: e.message,
+        hint: 'Confira a senha do certificado e se o .pfx é um e-CNPJ A1 válido.',
+      },
+    };
+  }
+  try {
+    const resultado = await mTlsRequestPfxRaw({
+      hostname: hostname || 'adn.nfse.gov.br',
+      path: adnPath.startsWith('/') ? adnPath : '/' + adnPath,
+      headers: { Accept: 'application/xml, application/json' },
+      pfx: pfxBuffer,
+      passphrase: cert_senha,
+    });
+    return { status: 200, data: resultado };
+  } catch (e) {
+    return { status: 502, data: { error: 'Falha na conexão mTLS com o ADN', detalhe: e.message } };
+  }
+}
+
 /**
  * Processa uma requisição proxy para o SERPRO (API Integra Contador).
  * Recebe credenciais + certificado PFX, faz mTLS, retorna o resultado.
@@ -857,7 +920,7 @@ const server = http.createServer(async (req, res) => {
   try { pathname = new URL(req.url, 'http://localhost').pathname; } catch {}
   // remove possíveis prefixos comuns antes da rota
   const stripPrefix = (p) => {
-    for (const prefix of ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy', '/health']) {
+    for (const prefix of ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy', '/adn-proxy', '/health']) {
       if (p === prefix || p === prefix + '/') return prefix;
       if (p.endsWith(prefix)) return prefix;
     }
@@ -871,8 +934,8 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.24.0',
-      endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy'],
+      version: '3.25.0',
+      endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy', '/adn-proxy'],
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
     }));
@@ -975,8 +1038,31 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── ADN NFS-e Nacional proxy (mTLS com certificado A1) ──
+  if (route === '/adn-proxy' && req.method === 'POST') {
+    const authHeader = req.headers.authorization;
+    if (authHeader !== `Bearer ${PROXY_API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized — API key inválida' }));
+      return;
+    }
+    let bodyStr = '';
+    for await (const chunk of req) bodyStr += chunk;
+    try {
+      const payload = JSON.parse(bodyStr);
+      const result = await handleAdnProxy(payload);
+      res.writeHead(result.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result.data));
+    } catch (error) {
+      console.error('[adn-proxy] Erro:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'PROXY_ROUTE_NOT_FOUND', received_path: pathname, method: req.method,       endpoints: ['/cora-proxy (POST)', '/hotmart-proxy (POST)', '/serpro-proxy (POST)', '/tessera-proxy (POST)', '/health (GET)'], hint: 'Se você acabou de implantar uma nova rota, aguarde o redeploy concluir e tente novamente.' }));
+  res.end(JSON.stringify({ error: 'PROXY_ROUTE_NOT_FOUND', received_path: pathname, method: req.method,       endpoints: ['/cora-proxy (POST)', '/hotmart-proxy (POST)', '/serpro-proxy (POST)', '/tessera-proxy (POST)', '/adn-proxy (POST)', '/health (GET)'], hint: 'Se você acabou de implantar uma nova rota, aguarde o redeploy concluir e tente novamente.' }));
 });
 
 server.listen(PORT, () => {
