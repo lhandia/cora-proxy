@@ -24,7 +24,7 @@ const RTC_ALIQUOTAS_NOMINAIS = process.env.RTC_ALIQUOTAS_NOMINAIS || '';
 // Calculadora oficial do Simples Nacional (CBS/IBS por operação no Simples).
 // O endpoint clássico aceita NF-e (55) e NFC-e (65) — NFS-e fica no motor interno.
 const RTC_SIMPLES_URL = (process.env.RTC_CALCULADORA_SIMPLES_URL || '').replace(/\/$/, '');
-const RTC_SIMPLES_PATH = process.env.RTC_CALCULADORA_SIMPLES_PATH || '/api/calculadora/observabilidade/simples-nacional';
+const RTC_SIMPLES_PATH = process.env.RTC_CALCULADORA_SIMPLES_PATH || '/api/calculadora/observabilidade/simples-nacional/nao-assistido';
 
 const rtcNum = (v) => {
   const n = Number(String(v ?? '').replace(',', '.'));
@@ -133,7 +133,11 @@ function rtcMapearResposta(corpo) {
     vIs += rtcNum(item?.tribCalc?.IS?.gIS?.vIS ?? item?.tribCalc?.IS?.vIS);
 
     const mem = ibsCbs?.memoriaCalculo || item?.memoriaCalculo;
-    if (mem) memorias.push(String(mem));
+    if (mem) {
+      memorias.push(typeof mem === 'object'
+        ? Object.values(mem).filter((v) => typeof v === 'string' && v.trim()).join('\n')
+        : String(mem));
+    }
   }
 
   // Os totais oficiais têm precedência sobre a soma dos itens.
@@ -216,6 +220,12 @@ async function handleRtcProxy(payload) {
 // resolve internamente o tpRBSN) + NCM/NBS + base. cAtivSN é opcional.
 
 /** Traduz o payload do Arcarius para o contrato oficial do Simples. */
+const ANEXOS_SIMPLES = { I: 'anexoI', II: 'anexoII', III: 'anexoIII', IV: 'anexoIV', V: 'anexoV' };
+
+/**
+ * Contrato vigente (v3.0.0): a linha de alíquotas efetivas do contribuinte vai
+ * na OPERAÇÃO, por anexo (aliquotasEfetivas.anexoX), e não mais por item.
+ */
 function rtcMontarOperacaoSimples(entrada) {
   const empresa = entrada?.empresa || {};
   const operacao = entrada?.operacao || {};
@@ -231,13 +241,11 @@ function rtcMontarOperacaoSimples(entrada) {
   const tpDoc = String(operacao.tp_doc || (tipo === 'servico' ? '91' : '55'));
   if (!['55', '65'].includes(tpDoc)) {
     return {
-      erro: 'A calculadora oficial do Simples Nacional cobre NF-e (55) e NFC-e (65). Operações de serviço (NFS-e) seguem no motor interno do Arcarius.',
+      erro: 'O motor oficial do Simples Nacional é usado aqui para NF-e (55) e NFC-e (65). Operações de serviço (NFS-e) seguem no motor interno do Arcarius.',
       sem_suporte: true,
     };
   }
 
-  // O motor oficial exige a atividade do Simples e as alíquotas efetivas de
-  // IBS/CBS da empresa; sem elas o item volta como NAO_CALCULADO.
   const cAtivSN = String(tributacao.cAtivSN || empresa.cAtivSN || '').trim();
   if (!cAtivSN) {
     return { erro: 'Atividade do Simples (cAtivSN) não informada. Cadastre no enquadramento da empresa.' };
@@ -248,14 +256,18 @@ function rtcMontarOperacaoSimples(entrada) {
     return { erro: 'Alíquotas efetivas de IBS e CBS do Simples não informadas. Cadastre no enquadramento da empresa.' };
   }
 
+  const anexo = String(empresa.anexo_simples || '').toUpperCase().replace(/[^IVX]/g, '');
+  const chaveAnexo = ANEXOS_SIMPLES[anexo];
+  if (!chaveAnexo) {
+    return { erro: 'Anexo do Simples Nacional (I a V) não informado na empresa.' };
+  }
+
   const item = {
     numero: 1,
     cAtivSN: cAtivSN.padStart(2, '0'),
     cClassTrib: String(tributacao.cClassTrib),
-    baseCalculo: rtcArred(rtcNum(operacao.valor)),
-    valorImpostoSeletivo: rtcArred(rtcNum(operacao.valor_is)),
-    pIBSSN,
-    pCBSSN,
+    baseCalculo: rtcNum(operacao.valor).toFixed(2),
+    valorImpostoSeletivo: rtcNum(operacao.valor_is).toFixed(2),
   };
   // Mercadoria usa NCM; serviço usa NBS — enviar os dois no mesmo item é inconsistência.
   if (tipo === 'servico') {
@@ -268,10 +280,15 @@ function rtcMontarOperacaoSimples(entrada) {
 
   const oficial = {
     id: crypto.createHash('md5').update(JSON.stringify(item) + data + tpDoc).digest('hex'),
-    versao: '2.0.0',
+    versao: '3.0.0',
     data,
     tpDoc,
     CRT: String(empresa.crt || operacao.crt || '1'),
+    aliquotasEfetivas: {
+      fatorR: false,
+      impedimentoSublimite: false,
+      [chaveAnexo]: { pCBSSN: pCBSSN.toFixed(4), pIBSSN: pIBSSN.toFixed(4) },
+    },
     itens: [item],
   };
   if (empresa.tpRegimeIBSCBS) oficial.tpRegimeIBSCBS = String(empresa.tpRegimeIBSCBS);
@@ -279,7 +296,6 @@ function rtcMontarOperacaoSimples(entrada) {
 
   return { operacao: oficial };
 }
-
 /** Converte a resposta do Simples para o formato plano do Arcarius. */
 function rtcMapearRespostaSimples(corpo) {
   const objetos = Array.isArray(corpo?.objetos) ? corpo.objetos : [];
@@ -367,8 +383,19 @@ async function handleRtcProxySimples(payload) {
   try { corpo = texto ? JSON.parse(texto) : null; } catch { corpo = null; }
 
   if (!resposta.ok) {
+    const erros = (corpo?.errors || []).map((e) => `${e.code || ''} ${e.title || ''}${e.pointer ? ` (${e.pointer})` : ''}${e.detail ? ': ' + e.detail : ''}`.trim());
     const detalhe = corpo?.detail || corpo?.title || corpo?.error || String(texto).slice(0, 300);
-    return { status: 422, data: { error: `Calculadora do Simples respondeu ${resposta.status}`, detalhe } };
+    return {
+      status: 422,
+      data: {
+        error: `Calculadora do Simples respondeu ${resposta.status}`,
+        detalhe,
+        erros,
+        calculadora_http: resposta.status,
+        calculadora_rota: rota,
+        amostra: corpo || String(texto).slice(0, 600),
+      },
+    };
   }
   if (!corpo) {
     return { status: 502, data: { error: 'Resposta da calculadora do Simples sem conteúdo interpretável.' } };
@@ -376,9 +403,19 @@ async function handleRtcProxySimples(payload) {
 
   const mapeado = rtcMapearRespostaSimples(corpo);
   if (mapeado.erros.length && mapeado.valor_ibs === 0 && mapeado.valor_cbs === 0) {
-    return { status: 422, data: { error: 'A calculadora do Simples não calculou a operação.', erros: mapeado.erros } };
+    return {
+      status: 422,
+      data: {
+        error: 'A calculadora do Simples não calculou a operação.',
+        erros: mapeado.erros,
+        calculadora_http: resposta.status,
+        calculadora_rota: rota,
+        amostra: corpo,
+      },
+    };
   }
   delete mapeado.erros;
+  mapeado.meta = { calculadora_http: resposta.status, calculadora_rota: rota };
   return { status: 200, data: mapeado };
 }
 
