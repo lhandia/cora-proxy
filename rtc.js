@@ -236,16 +236,31 @@ function rtcMontarOperacaoSimples(entrada) {
     };
   }
 
+  // O motor oficial exige a atividade do Simples e as alíquotas efetivas de
+  // IBS/CBS da empresa; sem elas o item volta como NAO_CALCULADO.
+  const cAtivSN = String(tributacao.cAtivSN || empresa.cAtivSN || '').trim();
+  if (!cAtivSN) {
+    return { erro: 'Atividade do Simples (cAtivSN) não informada. Cadastre no enquadramento da empresa.' };
+  }
+  const pIBSSN = rtcNum(tributacao.pIBSSN ?? empresa.pIBSSN);
+  const pCBSSN = rtcNum(tributacao.pCBSSN ?? empresa.pCBSSN);
+  if (!pIBSSN && !pCBSSN) {
+    return { erro: 'Alíquotas efetivas de IBS e CBS do Simples não informadas. Cadastre no enquadramento da empresa.' };
+  }
+
   const item = {
     numero: 1,
+    cAtivSN: cAtivSN.padStart(2, '0'),
     cClassTrib: String(tributacao.cClassTrib),
     baseCalculo: rtcArred(rtcNum(operacao.valor)),
+    valorImpostoSeletivo: rtcArred(rtcNum(operacao.valor_is)),
+    pIBSSN,
+    pCBSSN,
   };
   const ncm = rtcDigitos(tributacao.ncm);
   if (ncm) item.ncm = ncm;
   const nbs = rtcDigitos(tributacao.nbs);
   if (nbs) item.nbs = nbs;
-  if (tributacao.cAtivSN) item.cAtivSN = String(tributacao.cAtivSN).padStart(2, '0');
 
   const oficial = {
     id: crypto.createHash('md5').update(JSON.stringify(item) + data + tpDoc).digest('hex'),
