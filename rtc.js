@@ -257,10 +257,14 @@ function rtcMontarOperacaoSimples(entrada) {
     pIBSSN,
     pCBSSN,
   };
-  const ncm = rtcDigitos(tributacao.ncm);
-  if (ncm) item.ncm = ncm;
-  const nbs = rtcDigitos(tributacao.nbs);
-  if (nbs) item.nbs = nbs;
+  // Mercadoria usa NCM; serviço usa NBS — enviar os dois no mesmo item é inconsistência.
+  if (tipo === 'servico') {
+    const nbs = rtcDigitos(tributacao.nbs);
+    if (nbs) item.nbs = nbs;
+  } else {
+    const ncm = rtcDigitos(tributacao.ncm);
+    if (ncm) item.ncm = ncm;
+  }
 
   const oficial = {
     id: crypto.createHash('md5').update(JSON.stringify(item) + data + tpDoc).digest('hex'),
