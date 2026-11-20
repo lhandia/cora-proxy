@@ -11,6 +11,9 @@ const crypto = require('crypto');
 // Os certificados são recebidos por requisição (uma empresa = um certificado).
 
 const PROXY_API_KEY = process.env.PROXY_API_KEY || 'cora-proxy-change-this-key';
+
+// Ponte com a Calculadora oficial da Reforma Tributária (rota /rtc-proxy)
+const rtc = require('./rtc')({ apiKey: process.env.RTC_PROXY_API_KEY || PROXY_API_KEY });
 const HOTMART_PROXY_API_KEY = process.env.HOTMART_PROXY_API_KEY || PROXY_API_KEY;
 const PORT = process.env.PORT || 3001;
 
@@ -920,7 +923,7 @@ const server = http.createServer(async (req, res) => {
   try { pathname = new URL(req.url, 'http://localhost').pathname; } catch {}
   // remove possíveis prefixos comuns antes da rota
   const stripPrefix = (p) => {
-    for (const prefix of ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy', '/adn-proxy', '/health']) {
+    for (const prefix of ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy', '/adn-proxy', '/rtc-proxy', '/health']) {
       if (p === prefix || p === prefix + '/') return prefix;
       if (p.endsWith(prefix)) return prefix;
     }
@@ -934,8 +937,9 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'cora-mtls-proxy',
-      version: '3.25.0',
-      endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy', '/adn-proxy'],
+      version: '3.26.0',
+      endpoints: ['/cora-proxy', '/hotmart-proxy', '/serpro-proxy', '/tessera-proxy', '/adn-proxy', '/rtc-proxy'],
+      rtc_calculadora_configurada: rtc.configurada(),
       node_options: process.env.NODE_OPTIONS || '(não definido)',
       openssl_legacy_provider: (process.env.NODE_OPTIONS || '').includes('openssl-legacy-provider'),
     }));
@@ -1055,6 +1059,29 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(result.data));
     } catch (error) {
       console.error('[adn-proxy] Erro:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
+  // ── RTC (Reforma Tributária) proxy ──
+  if (route === '/rtc-proxy' && req.method === 'POST') {
+    const authHeader = req.headers.authorization;
+    if (authHeader !== 'Bearer ' + rtc.apiKey) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized — API key inválida' }));
+      return;
+    }
+    let bodyStr = '';
+    for await (const chunk of req) bodyStr += chunk;
+    try {
+      const payload = JSON.parse(bodyStr);
+      const result = await rtc.handleRtcProxy(payload);
+      res.writeHead(result.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result.data));
+    } catch (error) {
+      console.error('[rtc-proxy] Erro:', error.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: error.message }));
     }
