@@ -168,7 +168,10 @@ module.exports = function criarRtcProxy({ apiKey } = {}) {
     try { corpo = texto ? JSON.parse(texto) : null; } catch (e) { corpo = null; }
 
     if (!resposta.ok) {
-      return { status: 502, data: { error: 'Calculadora oficial respondeu ' + resposta.status, detalhe: corpo || String(texto).slice(0, 400) } };
+      // Rejeição de dados da calculadora (CST, cClassTrib, NBS, município) é devolvida
+      // como 422 para o Arcarius mostrar o motivo real ao usuário.
+      const rejeicao = [400, 404, 422].indexOf(resposta.status) !== -1;
+      return { status: rejeicao ? 422 : 502, data: { error: 'Calculadora oficial respondeu ' + resposta.status, detalhe: corpo || String(texto).slice(0, 400) } };
     }
     if (!corpo) return { status: 502, data: { error: 'Resposta da calculadora oficial sem conteúdo interpretável.' } };
 
