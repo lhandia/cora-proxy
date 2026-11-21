@@ -100,6 +100,15 @@ function rtcMontarOperacao(entrada) {
   };
 }
 
+// Rótulos da memória de cálculo por tributo. O texto devolvido pelo motor é
+// preservado integralmente; só a chave do objeto vira um rótulo legível.
+const ROTULOS_MEMORIA = {
+  cbs: 'CBS',
+  ibsUF: 'IBS estadual',
+  ibsMun: 'IBS municipal',
+  ibs: 'IBS',
+};
+
 /** Converte a resposta oficial para o formato plano que o Arcarius já consome. */
 function rtcMapearResposta(corpo) {
   const objetos = Array.isArray(corpo?.objetos) ? corpo.objetos : (corpo?.tribCalc ? [corpo] : []);
@@ -132,8 +141,19 @@ function rtcMapearResposta(corpo) {
     }
     vIs += rtcNum(item?.tribCalc?.IS?.gIS?.vIS ?? item?.tribCalc?.IS?.vIS);
 
+    // A memória do regime regular vem como um objeto por tributo (cbs, ibsUF,
+    // ibsMun). Cada texto é mantido na íntegra, um por linha rotulada — sem
+    // perder nenhum passo devolvido pelo motor.
     const mem = ibsCbs?.memoriaCalculo || item?.memoriaCalculo;
-    if (mem) memorias.push(typeof mem === 'string' ? mem : JSON.stringify(mem));
+    if (typeof mem === 'string') {
+      if (mem.trim()) memorias.push(mem.trim());
+    } else if (mem && typeof mem === 'object') {
+      for (const [chave, texto] of Object.entries(mem)) {
+        if (!texto) continue;
+        const rotulo = ROTULOS_MEMORIA[chave] || chave;
+        memorias.push(`${rotulo}: ${typeof texto === 'string' ? texto : JSON.stringify(texto)}`);
+      }
+    }
   }
 
   // Os totais oficiais têm precedência sobre a soma dos itens.
