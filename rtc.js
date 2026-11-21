@@ -133,11 +133,7 @@ function rtcMapearResposta(corpo) {
     vIs += rtcNum(item?.tribCalc?.IS?.gIS?.vIS ?? item?.tribCalc?.IS?.vIS);
 
     const mem = ibsCbs?.memoriaCalculo || item?.memoriaCalculo;
-    if (mem) {
-      memorias.push(typeof mem === 'object'
-        ? Object.values(mem).filter((v) => typeof v === 'string' && v.trim()).join('\n')
-        : String(mem));
-    }
+    if (mem) memorias.push(typeof mem === 'string' ? mem : JSON.stringify(mem));
   }
 
   // Os totais oficiais têm precedência sobre a soma dos itens.
@@ -197,15 +193,27 @@ async function handleRtcProxy(payload) {
   if (!resposta.ok) {
     return {
       status: 502,
-      data: { error: `Calculadora oficial respondeu ${resposta.status}`, detalhe: corpo || String(texto).slice(0, 400) },
+      data: {
+        error: `Calculadora oficial respondeu ${resposta.status}`,
+        calculadora_http: resposta.status,
+        calculadora_rota: rota,
+        detalhe: corpo || String(texto).slice(0, 400),
+      },
     };
   }
   if (!corpo) {
-    return { status: 502, data: { error: 'Resposta da calculadora oficial sem conteúdo interpretável.' } };
+    return { status: 502, data: { error: 'Resposta da calculadora oficial sem conteúdo interpretável.', calculadora_http: resposta.status, calculadora_rota: rota } };
   }
 
   const mapeado = rtcMapearResposta(corpo);
   const aviso = resposta.headers.get('x-warning-dados-simulados');
+  // Metadado verificável do trecho proxy → calculadora oficial.
+  mapeado.meta = {
+    calculadora_http: resposta.status,
+    calculadora_rota: rota,
+    aviso_simulado: aviso || '',
+    recebido_em: new Date().toISOString(),
+  };
   if (aviso) mapeado.memoria_calculo = `${aviso}\n${mapeado.memoria_calculo}`.trim();
 
   if (mapeado.erros.length && mapeado.valor_ibs === 0 && mapeado.valor_cbs === 0) {
@@ -219,13 +227,38 @@ async function handleRtcProxy(payload) {
 // Contrato oficial: CRT, tpRegimeIBSCBS, tpDoc e, por item, cClassTrib (que
 // resolve internamente o tpRBSN) + NCM/NBS + base. cAtivSN é opcional.
 
-/** Traduz o payload do Arcarius para o contrato oficial do Simples. */
+// Contrato oficial vigente (v3.0.0): a linha de alíquotas efetivas do
+// contribuinte vai na OPERAÇÃO, por anexo (aliquotasEfetivas.anexoX), e não
+// mais por item. O endpoint clássico está marcado como OBSOLETO no Swagger.
 const ANEXOS_SIMPLES = { I: 'anexoI', II: 'anexoII', III: 'anexoIII', IV: 'anexoIV', V: 'anexoV' };
 
-/**
- * Contrato vigente (v3.0.0): a linha de alíquotas efetivas do contribuinte vai
- * na OPERAÇÃO, por anexo (aliquotasEfetivas.anexoX), e não mais por item.
- */
+// Documentos aceitos pelo motor oficial do Simples. A NFS-e (91) usa o mesmo
+// endpoint, com o vocabulário do próprio documento (opSimpNac / regApTribSN) e
+// os fatos do ISSQN no item.
+const TPDOC_SIMPLES = ['55', '65', '91'];
+
+// Atividades do Simples com ISS na base: exigem tribISSQN (VSN-036) e, quando a
+// operação é tributável, tpRetISSQN (VSN-037). tpBM é opcional (VSN-038).
+const ATIVIDADES_COM_ISS = ['07', '09', '10', '12', '13', '14'];
+
+// A tabela vigente só parametriza tipo de documento a partir desta data.
+const VIGENCIA_TABELA_SIMPLES = '2027-01-01';
+
+const ROTULO_CAMPO = {
+  opSimpNac: 'a opção pelo Simples (opSimpNac)',
+  regApIBSCBSSN: 'o regime de apuração do IBS/CBS no Simples (regApIBSCBSSN)',
+  regApTribSN: 'o regime de apuração dos tributos no Simples (regApTribSN)',
+  tribISSQN: 'a tributação do ISSQN (tribISSQN)',
+  tpRetISSQN: 'a retenção do ISSQN (tpRetISSQN)',
+  tpBM: 'o benefício municipal do ISSQN (tpBM)',
+};
+
+/** Mensagem única para os campos obrigatórios que faltam. */
+function rtcMensagemPendentes(pendentes) {
+  return `Informe ${pendentes.map((c) => ROTULO_CAMPO[c] || c).join('; ')}.`;
+}
+
+/** Traduz o payload do Arcarius para o contrato oficial do Simples (v3.0.0). */
 function rtcMontarOperacaoSimples(entrada) {
   const empresa = entrada?.empresa || {};
   const operacao = entrada?.operacao || {};
@@ -239,35 +272,69 @@ function rtcMontarOperacaoSimples(entrada) {
 
   const tipo = String(operacao.tipo || 'servico');
   const tpDoc = String(operacao.tp_doc || (tipo === 'servico' ? '91' : '55'));
-  if (!['55', '65'].includes(tpDoc)) {
+  if (!TPDOC_SIMPLES.includes(tpDoc)) {
     return {
-      erro: 'O motor oficial do Simples Nacional é usado aqui para NF-e (55) e NFC-e (65). Operações de serviço (NFS-e) seguem no motor interno do Arcarius.',
+      erro: `O motor oficial do Simples Nacional não aceita o tipo de documento ${tpDoc}.`,
       sem_suporte: true,
     };
   }
 
-  const cAtivSN = String(tributacao.cAtivSN || empresa.cAtivSN || '').trim();
-  if (!cAtivSN) {
-    return { erro: 'Atividade do Simples (cAtivSN) não informada. Cadastre no enquadramento da empresa.' };
+  // Vigência: a tabela instalada não cobre tipo de documento antes de 2027.
+  // A calculadora responde VSN-015 nesse caso; a checagem evita a chamada e
+  // deixa o motivo explícito para a tela.
+  if (data < VIGENCIA_TABELA_SIMPLES) {
+    return {
+      erro: `Cálculo oficial indisponível para esta data: a tabela vigente do motor do Simples não cobre o tipo de documento ${tpDoc} antes de 01/01/2027.`,
+      fora_vigencia: true,
+    };
+  }
+
+  // O motor oficial exige a atividade do Simples e as alíquotas efetivas de
+  // IBS/CBS da empresa; sem elas a operação é rejeitada na validação global.
+  const cAtivSN = String(tributacao.cAtivSN || empresa.cAtivSN || '').trim().padStart(2, '0');
+  if (!cAtivSN || cAtivSN === '00') {
+    return { erro: 'Atividade do Simples (cAtivSN) não informada. Cadastre no enquadramento da empresa.', campos_pendentes: ['cAtivSN'] };
   }
   const pIBSSN = rtcNum(tributacao.pIBSSN ?? empresa.pIBSSN);
   const pCBSSN = rtcNum(tributacao.pCBSSN ?? empresa.pCBSSN);
   if (!pIBSSN && !pCBSSN) {
-    return { erro: 'Alíquotas efetivas de IBS e CBS do Simples não informadas. Cadastre no enquadramento da empresa.' };
+    return { erro: 'Alíquotas efetivas de IBS e CBS do Simples não informadas. Cadastre no enquadramento da empresa.', campos_pendentes: ['pIBSSN', 'pCBSSN'] };
   }
 
   const anexo = String(empresa.anexo_simples || '').toUpperCase().replace(/[^IVX]/g, '');
   const chaveAnexo = ANEXOS_SIMPLES[anexo];
   if (!chaveAnexo) {
-    return { erro: 'Anexo do Simples Nacional (I a V) não informado na empresa.' };
+    return { erro: 'Anexo do Simples Nacional (I a V) não informado na empresa.', campos_pendentes: ['anexo_simples'] };
+  }
+
+  const ehNfse = tpDoc === '91';
+
+  // NFS-e: o regime vem no vocabulário do documento e CRT/tpRegimeIBSCBS são
+  // proibidos (VSN-033). opSimpNac é sempre obrigatório; com ME/EPP (3) ou
+  // opção pendente (4) a calculadora também exige os dois regimes de apuração.
+  let opSimpNac = '';
+  let regApIBSCBSSN = '';
+  let regApTribSN = '';
+  if (ehNfse) {
+    const pendentes = [];
+    opSimpNac = String(tributacao.opSimpNac || empresa.opSimpNac || '').trim();
+    if (!['1', '2', '3', '4'].includes(opSimpNac)) pendentes.push('opSimpNac');
+    if (['3', '4'].includes(opSimpNac)) {
+      regApIBSCBSSN = String(tributacao.regApIBSCBSSN || '').trim();
+      regApTribSN = String(tributacao.regApTribSN || '').trim();
+      if (!['1', '2', '3'].includes(regApIBSCBSSN)) pendentes.push('regApIBSCBSSN');
+      if (!['1', '2', '3'].includes(regApTribSN)) pendentes.push('regApTribSN');
+    }
+    if (pendentes.length) {
+      return { erro: `NFS-e: ${rtcMensagemPendentes(pendentes)}`, campos_pendentes: pendentes };
+    }
   }
 
   const item = {
     numero: 1,
-    cAtivSN: cAtivSN.padStart(2, '0'),
+    cAtivSN,
     cClassTrib: String(tributacao.cClassTrib),
     baseCalculo: rtcNum(operacao.valor).toFixed(2),
-    valorImpostoSeletivo: rtcNum(operacao.valor_is).toFixed(2),
   };
   // Mercadoria usa NCM; serviço usa NBS — enviar os dois no mesmo item é inconsistência.
   if (tipo === 'servico') {
@@ -278,12 +345,34 @@ function rtcMontarOperacaoSimples(entrada) {
     if (ncm) item.ncm = ncm;
   }
 
+  if (ehNfse) {
+    // Fatos do ISSQN: só são enviados quando informados. Nada é preenchido por
+    // padrão — a ausência vira campo pendente, não um valor arbitrário.
+    const tribISSQN = String(tributacao.tribISSQN || '').trim();
+    const tpRetISSQN = String(tributacao.tpRetISSQN || '').trim();
+    const tpBM = String(tributacao.tpBM || '').trim();
+    const pendentes = [];
+    if (ATIVIDADES_COM_ISS.includes(cAtivSN)) {
+      if (!['1', '2', '3', '4'].includes(tribISSQN)) pendentes.push('tribISSQN');
+      if (tribISSQN === '1' && !['1', '2', '3'].includes(tpRetISSQN)) pendentes.push('tpRetISSQN');
+    }
+    if (tpBM && !['1', '2', '3', '4'].includes(tpBM)) pendentes.push('tpBM');
+    if (pendentes.length) {
+      return { erro: `NFS-e: ${rtcMensagemPendentes(pendentes)}`, campos_pendentes: pendentes };
+    }
+    if (tribISSQN) item.tribISSQN = tribISSQN;
+    if (tpRetISSQN) item.tpRetISSQN = tpRetISSQN;
+    if (tpBM) item.tpBM = tpBM;
+  } else {
+    // Documentos com CRT repassam o IS já calculado; a NFS-e não tem IS.
+    item.valorImpostoSeletivo = rtcNum(operacao.valor_is).toFixed(2);
+  }
+
   const oficial = {
     id: crypto.createHash('md5').update(JSON.stringify(item) + data + tpDoc).digest('hex'),
     versao: '3.0.0',
     data,
     tpDoc,
-    CRT: String(empresa.crt || operacao.crt || '1'),
     aliquotasEfetivas: {
       fatorR: false,
       impedimentoSublimite: false,
@@ -291,11 +380,20 @@ function rtcMontarOperacaoSimples(entrada) {
     },
     itens: [item],
   };
-  if (empresa.tpRegimeIBSCBS) oficial.tpRegimeIBSCBS = String(empresa.tpRegimeIBSCBS);
+
+  if (ehNfse) {
+    oficial.opSimpNac = opSimpNac;
+    if (regApIBSCBSSN) oficial.regApIBSCBSSN = regApIBSCBSSN;
+    if (regApTribSN) oficial.regApTribSN = regApTribSN;
+  } else {
+    oficial.CRT = String(empresa.crt || operacao.crt || '1');
+    if (empresa.tpRegimeIBSCBS) oficial.tpRegimeIBSCBS = String(empresa.tpRegimeIBSCBS);
+  }
   if (empresa.tpEnteGov) oficial.tpEnteGov = String(empresa.tpEnteGov);
 
   return { operacao: oficial };
 }
+
 /** Converte a resposta do Simples para o formato plano do Arcarius. */
 function rtcMapearRespostaSimples(corpo) {
   const objetos = Array.isArray(corpo?.objetos) ? corpo.objetos : [];
@@ -325,7 +423,10 @@ function rtcMapearRespostaSimples(corpo) {
 
     const mem = t.memoriaCalculo;
     if (mem) {
-      const partes = [mem.ibs, mem.cbs].filter(Boolean).join('\n');
+      const partes = [mem.ibs, mem.cbs]
+        .filter(Boolean)
+        .map((p) => (typeof p === 'string' ? p : JSON.stringify(p)))
+        .join('\n');
       if (partes) memorias.push(partes);
     }
   }
@@ -361,7 +462,25 @@ async function handleRtcProxySimples(payload) {
   }
 
   const montada = rtcMontarOperacaoSimples(payload);
-  if (montada.erro) return { status: montada.sem_suporte ? 501 : 400, data: { error: montada.erro } };
+  if (montada.erro) {
+    if (montada.fora_vigencia) {
+      return {
+        status: 422,
+        data: {
+          error: montada.erro,
+          codigo: 'FORA_VIGENCIA_TABELA',
+          vigencia: {
+            data_operacao: String(payload?.operacao?.data || '').slice(0, 10),
+            data_minima: VIGENCIA_TABELA_SIMPLES,
+          },
+        },
+      };
+    }
+    return {
+      status: montada.sem_suporte ? 501 : 400,
+      data: { error: montada.erro, campos_pendentes: montada.campos_pendentes || [] },
+    };
+  }
 
   const rota = RTC_SIMPLES_PATH.startsWith('/') ? RTC_SIMPLES_PATH : '/' + RTC_SIMPLES_PATH;
   const url = `${RTC_SIMPLES_URL}${rota}`;
@@ -383,39 +502,24 @@ async function handleRtcProxySimples(payload) {
   try { corpo = texto ? JSON.parse(texto) : null; } catch { corpo = null; }
 
   if (!resposta.ok) {
-    const erros = (corpo?.errors || []).map((e) => `${e.code || ''} ${e.title || ''}${e.pointer ? ` (${e.pointer})` : ''}${e.detail ? ': ' + e.detail : ''}`.trim());
     const detalhe = corpo?.detail || corpo?.title || corpo?.error || String(texto).slice(0, 300);
-    return {
-      status: 422,
-      data: {
-        error: `Calculadora do Simples respondeu ${resposta.status}`,
-        detalhe,
-        erros,
-        calculadora_http: resposta.status,
-        calculadora_rota: rota,
-        amostra: corpo || String(texto).slice(0, 600),
-      },
-    };
+    return { status: 422, data: { error: `Calculadora do Simples respondeu ${resposta.status}`, calculadora_http: resposta.status, calculadora_rota: rota, detalhe } };
   }
   if (!corpo) {
     return { status: 502, data: { error: 'Resposta da calculadora do Simples sem conteúdo interpretável.' } };
   }
 
   const mapeado = rtcMapearRespostaSimples(corpo);
+  // Metadado verificável do trecho proxy → calculadora oficial do Simples.
+  mapeado.meta = {
+    calculadora_http: resposta.status,
+    calculadora_rota: rota,
+    recebido_em: new Date().toISOString(),
+  };
   if (mapeado.erros.length && mapeado.valor_ibs === 0 && mapeado.valor_cbs === 0) {
-    return {
-      status: 422,
-      data: {
-        error: 'A calculadora do Simples não calculou a operação.',
-        erros: mapeado.erros,
-        calculadora_http: resposta.status,
-        calculadora_rota: rota,
-        amostra: corpo,
-      },
-    };
+    return { status: 422, data: { error: 'A calculadora do Simples não calculou a operação.', calculadora_http: resposta.status, calculadora_rota: rota, erros: mapeado.erros, amostra: corpo } };
   }
   delete mapeado.erros;
-  mapeado.meta = { calculadora_http: resposta.status, calculadora_rota: rota };
   return { status: 200, data: mapeado };
 }
 
